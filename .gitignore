@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+generated_reports/
+app_settings.json
+requests.db
+requests.db-*
