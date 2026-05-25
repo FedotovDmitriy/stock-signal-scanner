@@ -14,6 +14,56 @@ python app.py
 http://127.0.0.1:8787
 ```
 
+## Хостинг
+
+### Рекомендуемый вариант
+
+Для этого проекта лучше всего подходит Docker-хостинг или VPS, потому что приложению нужен постоянный процесс для Telegram, локальная SQLite-база и Chromium для PDF.
+
+Подготовленные файлы:
+
+- `Dockerfile` - контейнер с Python и Chromium.
+- `docker-compose.yml` - запуск на VPS.
+- `render.yaml` - быстрый деплой на Render с persistent disk.
+
+### Запуск через Docker на сервере
+
+```bash
+git clone https://github.com/FedotovDmitriy/stock-signal-scanner.git
+cd stock-signal-scanner
+docker compose up -d --build
+```
+
+После запуска откройте:
+
+```text
+http://SERVER_IP:8787
+```
+
+Данные приложения сохраняются в папке:
+
+```text
+./data
+```
+
+Там будут `app_settings.json`, `requests.db` и PDF-отчёты. Эта папка не должна попадать в GitHub.
+
+### Render
+
+1. Создайте новый Web Service из репозитория `FedotovDmitriy/stock-signal-scanner`.
+2. Выберите Docker runtime.
+3. Render прочитает `render.yaml`.
+4. После деплоя откройте URL сервиса.
+5. Введите Telegram token, Chat ID, Webhook/API token и API-ключи в интерфейсе.
+6. Нажмите `Сохранить ключи`.
+
+### Переменные окружения
+
+- `HOST=0.0.0.0` - для сервера.
+- `PORT` - обычно задаётся хостингом автоматически.
+- `DATA_DIR=/app/data` - папка для базы, настроек и отчётов.
+- `FUNDREP_TEMPLATE_PDF` - необязательный путь к PDF-шаблону, если он будет нужен на сервере.
+
 ## Что внутри
 
 - Таймфрейм выбирается в интерфейсе: `1m`, `5m`, `15m`, `30m`, `1h`, `1d`, `1wk`.

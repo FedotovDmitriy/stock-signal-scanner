@@ -23,16 +23,21 @@ from pathlib import Path
 from typing import Any
 
 
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 HOST = os.environ.get("HOST", "127.0.0.1")
-PORT = 8787
+PORT = int(os.environ.get("PORT", "8787"))
 MAX_TICKER_LENGTH = 12
 TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-=]{0,11}$")
 FUNDREP_PDF = Path(
-    r"C:\Users\fnemo\Documents\Codex\2026-05-23\https-www-youtube-com-watch-v\investment_kpi_framework_ru.pdf"
+    os.environ.get(
+        "FUNDREP_TEMPLATE_PDF",
+        r"C:\Users\fnemo\Documents\Codex\2026-05-23\https-www-youtube-com-watch-v\investment_kpi_framework_ru.pdf",
+    )
 )
-REPORTS_DIR = Path(__file__).resolve().parent / "generated_reports"
-APP_CONFIG_FILE = Path(__file__).resolve().parent / "app_settings.json"
-REQUEST_DB_FILE = Path(__file__).resolve().parent / "requests.db"
+REPORTS_DIR = DATA_DIR / "generated_reports"
+APP_CONFIG_FILE = DATA_DIR / "app_settings.json"
+REQUEST_DB_FILE = DATA_DIR / "requests.db"
 MAX_REQUEST_LOGS = 80
 
 sent_signals: set[str] = set()
@@ -97,6 +102,7 @@ def now_iso() -> str:
 
 
 def init_request_db() -> None:
+    REQUEST_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     with request_db_lock:
         with sqlite3.connect(REQUEST_DB_FILE) as conn:
             conn.execute(
@@ -196,6 +202,7 @@ def load_app_config() -> dict[str, Any]:
 
 def save_app_config(config: dict[str, Any]) -> dict[str, Any]:
     cleaned = clean_config(config)
+    APP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     APP_CONFIG_FILE.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     return cleaned
 
@@ -1344,6 +1351,11 @@ def find_chrome_executable() -> str | None:
         shutil.which("chrome.exe"),
         shutil.which("msedge"),
         shutil.which("msedge.exe"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",

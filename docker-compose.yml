@@ -1,0 +1,13 @@
+services:
+  stock-signal-scanner:
+    build: .
+    container_name: stock-signal-scanner
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      DATA_DIR: /app/data
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/app/data

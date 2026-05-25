@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: stock-signal-scanner
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    disk:
+      name: stock-signal-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /app/data
