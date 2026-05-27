@@ -12,7 +12,7 @@ DEFAULT_STRATEGIES = "trend,breakout,volume_avwap,momentum"
 [[d1_databases]]
 binding = "DB"
 database_name = "stock_signal_scanner_dev"
-database_id = "REPLACE_WITH_DEV_D1_DATABASE_ID"
+database_id = "1111d17b-d208-44d1-bca4-c651ee65f54c"
 
 [env.production]
 name = "stock-signal-scanner-production"
@@ -27,4 +27,5 @@ DEFAULT_STRATEGIES = "trend,breakout,volume_avwap,momentum"
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "stock_signal_scanner_production"
-database_id = "REPLACE_WITH_PRODUCTION_D1_DATABASE_ID"
+database_id = "e42468e1-eca6-41b1-aee6-5e59f08d678f"
+

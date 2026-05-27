@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "cf:dev": "wrangler dev",
-    "cf:deploy:dev": "wrangler deploy",
+    "cf:deploy:dev": "wrangler deploy --env=\"\"",
     "cf:deploy:production": "wrangler deploy --env production",
     "cf:d1:create:dev": "wrangler d1 create stock_signal_scanner_dev",
     "cf:d1:create:production": "wrangler d1 create stock_signal_scanner_production",
