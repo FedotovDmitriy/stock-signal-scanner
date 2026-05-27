@@ -5,3 +5,9 @@ data/
 app_settings.json
 requests.db
 requests.db-*
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+.npm-cache/
+.wrangler-config/

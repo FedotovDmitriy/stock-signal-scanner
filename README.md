@@ -16,6 +16,17 @@ http://127.0.0.1:8787
 
 ## Хостинг
 
+### Cloudflare
+
+Для переноса серверной части в Cloudflare добавлен отдельный Worker backend:
+
+- `cloudflare/worker.js`
+- `cloudflare/schema.sql`
+- `wrangler.toml`
+- `CLOUDFLARE_DEPLOY.md`
+
+Cloudflare-версия принимает запросы от сторонних приложений, принимает Telegram webhook, делает технический анализ и отправляет ответ в Telegram. Подробные шаги деплоя находятся в `CLOUDFLARE_DEPLOY.md`.
+
 ### Рекомендуемый вариант
 
 Для этого проекта лучше всего подходит Docker-хостинг или VPS, потому что приложению нужен постоянный процесс для Telegram, локальная SQLite-база и Chromium для PDF.
