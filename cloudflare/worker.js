@@ -344,38 +344,71 @@ function analysisReportMessage(result) {
 function fundRepMessage(ticker, result) {
   const row = result.rows[0];
   if (!row) return reportErrorMessage("FundRep", ticker, result);
-  const trend = row.price > row.ema200 && row.price > row.avwap ? "бычий" : row.price < row.ema200 && row.price < row.avwap ? "медвежий" : "нейтральный";
-  const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
-  const bestSignals = row.signals.slice(0, 4);
+  const price = `${row.price.toFixed(2)} USD`;
+  const na = "н/д";
   const lines = [
-    `📘 FundRep ${ticker}`,
+    `FundRep: фундаментальный отчёт по ${ticker}`,
+    `Дата: ${result.timestamp}`,
+    "Не является инвестиционной рекомендацией.",
     "━━━━━━━━━━━━━━",
     "",
-    `Время: ${result.timestamp}`,
-    `Цена: ${row.price.toFixed(2)}`,
-    `Движение: ${movement}`,
-    `Тренд: ${trend}`,
+    "1. Profitability / Прибыльность",
+    "Компания реально зарабатывает деньги и становится ли бизнес эффективнее?",
+    `Компания: ${ticker}`,
+    `Текущая цена: ${price}`,
+    "Рыночная цена нужна как отправная точка для сравнения с фундаментальными метриками.",
+    `Revenue Growth / Рост выручки: ${na}`,
+    "Показывает темп роста верхней строки. Ускорение роста обычно поддерживает оценку компании.",
+    `Gross Margin / Валовая маржа: ${na}`,
+    "Показывает ценовую силу продукта и эффективность себестоимости.",
+    `Operating Margin / Операционная маржа: ${na}`,
+    "Показывает прибыльность основного бизнеса после операционных расходов.",
+    `Net Margin / Чистая маржа: ${na}`,
+    "Показывает, сколько прибыли остаётся акционерам после всех расходов.",
+    `EPS / Прибыль на акцию: ${na}`,
+    `EBITDA: ${na}`,
     "",
-    "Ключевые метрики:",
-    `EMA200: ${valueOrDash(row.ema200)}`,
-    `AVWAP: ${valueOrDash(row.avwap)}`,
-    `RSI: ${valueOrDash(row.rsi14)}`,
-    `ROC20: ${valueOrDash(row.roc20)}%`,
+    "2. Valuation / Оценка стоимости",
+    "Хорошая ли это компания по разумной цене, или рынок уже заложил слишком много ожиданий?",
+    `Market Cap / Капитализация: ${na}`,
+    `P/E / Цена к прибыли: ${na}`,
+    `Forward P/E / Будущий P/E: ${na}`,
+    `P/S / Цена к выручке: ${na}`,
+    `EV / EBITDA: ${na}`,
+    `PEG Ratio: ${na}`,
+    `P/B / Цена к балансовой стоимости: ${na}`,
     "",
-    "Вывод:",
-    row.signals.length ? "Есть технические сигналы, требующие проверки на новостях, отчётности и рисках компании." : "Явных технических сигналов нет; лучше ждать подтверждения тренда и объёма.",
+    "3. Cash Flow / Денежный поток",
+    "Настоящая ли прибыль, и превращается ли бизнес в реальные свободные деньги?",
+    `Operating Cash Flow / OCF: ${na}`,
+    `Free Cash Flow / FCF: ${na}`,
+    `FCF Margin: ${na}`,
+    `FCF Yield: ${na}`,
+    "",
+    "4. Financial Health / Финансовое здоровье",
+    "Компания выдержит спад и сможет финансировать рост без разрушения баланса?",
+    `Debt-to-Equity / D/E: ${na}`,
+    `Total Cash / Денежные средства: ${na}`,
+    `Total Debt / Общий долг: ${na}`,
+    `Current Ratio: ${na}`,
+    `ROE / Рентабельность капитала: ${na}`,
+    `ROA / Рентабельность активов: ${na}`,
+    "",
+    "5. Forward Signals / Будущие сигналы",
+    "Куда меняются ожидания по компании?",
+    `Recommendation: ${na}`,
+    `Target Mean Price: ${na}`,
+    `Earnings Growth: ${na}`,
+    `Revenue Growth: ${na}`,
+    `Beta: ${na}`,
+    `Dividend Yield: ${na}`,
+    "",
+    "Технический контекст:",
+    `Движение: ${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`,
+    `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%`,
+    "",
+    "Короткая шпаргалка: Profitability отвечает на вопрос о качестве прибыли; Valuation — о цене; Cash Flow — о реальных деньгах; Financial Health — о прочности баланса; Forward Signals — об ожиданиях рынка.",
   ];
-  if (bestSignals.length) {
-    lines.push("", "Сигналы:");
-    bestSignals.forEach((signal, index) => {
-      if (index > 0) lines.push("━━━━━━━━━━━━━━");
-      lines.push(`${signal.side === "long" ? "📈" : "📉"} ${signal.side} / ${signal.strategy}`);
-      lines.push(`Условие: ${signal.condition}`);
-      lines.push(`Идея: ${signal.idea}`);
-      lines.push(`Стоп: ${signal.stop.toFixed(2)}`);
-      lines.push(`Цель: ${signal.target.toFixed(2)}`);
-    });
-  }
   return lines.join("\n").trim();
 }
 
