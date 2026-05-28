@@ -20,6 +20,8 @@ The project uses one GitHub repository and two Cloudflare environments:
 - `GET /api/status` - environment, status and recent logs.
 - `POST /api/external/analyze` - request from an external application.
 - `POST /api/webhook/analyze` - alternative external webhook URL.
+- `POST /api/test-telegram` - send a test Telegram message through Worker secrets.
+- `POST /api/clear-logs` - clear monitoring request logs.
 - `POST /telegram/webhook` - Telegram webhook.
 
 ## 1. Install tools
@@ -78,6 +80,27 @@ npm run cf:d1:migrate:production
 
 For local development, create `.dev.vars` from `.dev.vars.example`.
 
+You can add secrets from the Cloudflare dashboard UI:
+
+1. Open Cloudflare Dashboard.
+2. Go to Workers & Pages.
+3. Open `stock-signal-scanner-dev` or `stock-signal-scanner-production`.
+4. Open Settings -> Variables.
+5. Add each value as a Secret, not as a plain text variable.
+
+Required secrets:
+
+- `WEBHOOK_TOKEN` - token used by the Pages monitor and `telegram_company_matcher_app`.
+- `TELEGRAM_BOT_TOKEN` - default Telegram bot token.
+- `TELEGRAM_CHAT_ID` - optional default chat for tests and fallback delivery.
+
+Optional per-bot secrets:
+
+- `TELEGRAM_BOT_TOKEN_US_STOCKS_BOT` for `bot.id = "us-stocks-bot"`.
+- `TELEGRAM_BOT_TOKEN_ISRAEL_STOCKS_BOT` for `bot.id = "israel-stocks-bot"`.
+
+The Worker resolves Telegram token in this order: `bot.tokenSecretName`, then `TELEGRAM_BOT_TOKEN_<BOT_ID>`, then `TELEGRAM_BOT_TOKEN`.
+
 For dev environment:
 
 ```powershell
@@ -117,7 +140,42 @@ https://stock-signal-scanner-dev.USERNAME.workers.dev
 https://stock-signal-scanner-production.USERNAME.workers.dev
 ```
 
-## 7. Connect Telegram webhook
+## 7. Deploy monitoring UI to Cloudflare Pages
+
+The monitoring UI lives in:
+
+```text
+cloudflare/pages/index.html
+```
+
+Run it locally:
+
+```powershell
+npm run cf:pages:dev
+```
+
+Deploy dev Pages:
+
+```powershell
+npm run cf:pages:deploy:dev
+```
+
+Deploy production Pages:
+
+```powershell
+npm run cf:pages:deploy:production
+```
+
+After opening the Pages URL, fill in:
+
+- Worker API URL, for example `https://stock-signal-scanner-dev.USERNAME.workers.dev`.
+- `WEBHOOK_TOKEN` value.
+- Optional Telegram Chat ID for the test message.
+- Optional bot id, for example `us-stocks-bot`.
+
+The Pages app does not store Telegram bot tokens. Telegram tokens stay in Worker secrets.
+
+## 8. Connect Telegram webhook
 
 Dev bot:
 
@@ -141,7 +199,7 @@ Check webhook:
 Invoke-RestMethod "https://api.telegram.org/bot$botToken/getWebhookInfo"
 ```
 
-## 8. External server request
+## 9. External server request
 
 Dev:
 
@@ -182,15 +240,15 @@ One-request overrides:
 }
 ```
 
+`telegram_company_matcher_app` can send the full news payload with `country`, `bot`, `telegramChatId`, `news`, object-style `tickers`, and `analysis`. The Worker stores the news and ticker links in D1, sends the news first, then sends the analysis report.
+
 ## First-stage limitations
 
 - `FundRep` PDF and `PromtRep` PDF are not yet moved to Workers.
 - Fundamental providers FMP/Polygon/Finnhub are not yet moved to Workers.
-- Monitoring UI is not yet moved to Cloudflare Pages.
 
 Next stages:
 
 1. Add environment-specific Telegram bots: onboarding-dev, US-dev, Israel-dev, then production bots.
-2. Move monitoring UI to Cloudflare Pages.
-3. Add payment-provider integration.
-4. Add premium report generation through a PDF service or separate rendering worker/service.
+2. Add payment-provider integration.
+3. Add premium report generation through a PDF service or separate rendering worker/service.

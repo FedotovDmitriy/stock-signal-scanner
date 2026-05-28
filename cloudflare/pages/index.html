@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stock Signal Scanner Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101316;
+      --panel: #171c20;
+      --panel-2: #11161a;
+      --text: #eef3f6;
+      --muted: #9aa8b2;
+      --line: #2c363d;
+      --green: #68d391;
+      --blue: #7dd3fc;
+      --red: #fb7185;
+      --amber: #fbbf24;
+      --shadow: 0 18px 46px rgba(0, 0, 0, .26);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .shell {
+      width: min(1360px, 100%);
+      margin: 0 auto;
+      padding: 22px;
+      display: grid;
+      gap: 18px;
+    }
+    header {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) minmax(360px, 560px);
+      gap: 16px;
+      align-items: end;
+    }
+    h1 { margin: 0; font-size: 28px; letter-spacing: 0; }
+    .sub { margin: 8px 0 0; color: var(--muted); max-width: 720px; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .metric, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .metric { padding: 12px; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 5px; font-size: 15px; overflow-wrap: anywhere; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(320px, 420px) 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+    .form { padding: 18px; display: grid; gap: 16px; }
+    .section-title {
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 760;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin-bottom: 8px;
+    }
+    label { color: var(--muted); display: grid; gap: 7px; }
+    input, textarea, select {
+      width: 100%;
+      color: var(--text);
+      background: #0d1114;
+      border: 1px solid #334047;
+      border-radius: 7px;
+      padding: 10px 11px;
+      outline: none;
+      min-height: 40px;
+    }
+    textarea { min-height: 86px; resize: vertical; }
+    input:focus, textarea:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(125, 211, 252, .12); }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .checks { display: grid; gap: 8px; }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 42px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 7px;
+      color: var(--text);
+    }
+    .check input { width: 16px; min-height: 16px; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    button {
+      border: 0;
+      border-radius: 7px;
+      color: #07100c;
+      background: var(--green);
+      padding: 11px 12px;
+      font-weight: 760;
+      cursor: pointer;
+      min-height: 42px;
+    }
+    button.secondary { background: var(--blue); color: #071016; }
+    button.danger { background: var(--red); color: #18070b; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .hint { margin: 0; color: var(--muted); font-size: 12px; }
+    .workspace { display: grid; gap: 18px; }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .toolbar strong { font-size: 16px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: #11171a;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 800px; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; background: rgba(13, 17, 20, .4); }
+    .ticker { font-weight: 800; }
+    .long { color: var(--green); font-weight: 760; }
+    .short { color: var(--red); font-weight: 760; }
+    .none { color: var(--muted); }
+    .logs { display: grid; gap: 8px; padding: 14px 16px 16px; }
+    .log-row {
+      display: grid;
+      grid-template-columns: 148px 1fr;
+      gap: 10px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11171a;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .log-row span { color: var(--muted); overflow-wrap: anywhere; }
+    .toast { min-height: 38px; color: var(--amber); padding: 0 16px 14px; }
+    .empty { color: var(--muted); padding: 22px; text-align: center; }
+    code { color: var(--blue); overflow-wrap: anywhere; }
+    @media (max-width: 980px) {
+      .shell { padding: 16px; }
+      header, main { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>Stock Signal Scanner</h1>
+        <p class="sub">Панель мониторинга для Cloudflare Worker: статус, логи, внешний анализ и проверка Telegram через Worker secrets.</p>
+      </div>
+      <div class="metrics">
+        <div class="metric"><span>Worker</span><strong id="workerState">-</strong></div>
+        <div class="metric"><span>Среда</span><strong id="environment">-</strong></div>
+        <div class="metric"><span>Последнее обновление</span><strong id="updatedAt">-</strong></div>
+      </div>
+    </header>
+
+    <main>
+      <aside class="panel form">
+        <div>
+          <div class="section-title">Подключение</div>
+          <label>Worker API URL
+            <input id="apiBase" placeholder="https://stock-signal-scanner-dev.example.workers.dev">
+          </label>
+        </div>
+        <label>Webhook/API token
+          <input id="apiToken" type="password" autocomplete="off" placeholder="WEBHOOK_TOKEN из Worker secret">
+        </label>
+
+        <div>
+          <div class="section-title">Анализ</div>
+          <label>Тикеры
+            <textarea id="tickers">AAPL, MSFT, NVDA</textarea>
+          </label>
+        </div>
+        <div class="grid-2">
+          <label>Таймфрейм
+            <select id="timeframe">
+              <option value="1m">1 минута</option>
+              <option value="5m">5 минут</option>
+              <option value="15m">15 минут</option>
+              <option value="30m">30 минут</option>
+              <option value="1h">1 час</option>
+              <option value="1d" selected>1 день</option>
+              <option value="1wk">1 неделя</option>
+            </select>
+          </label>
+          <label>Риск, %
+            <input id="risk" type="number" min="0.1" step="0.1" value="1">
+          </label>
+        </div>
+        <div class="checks">
+          <label class="check"><input type="checkbox" name="strategy" value="trend" checked> Trend Following</label>
+          <label class="check"><input type="checkbox" name="strategy" value="breakout" checked> Breakout Trading</label>
+          <label class="check"><input type="checkbox" name="strategy" value="volume_avwap" checked> Volume Profile + AVWAP</label>
+          <label class="check"><input type="checkbox" name="strategy" value="momentum" checked> Momentum Trading</label>
+        </div>
+        <label>Telegram Chat ID для теста
+          <input id="telegramChatId" placeholder="Можно оставить пустым для env TELEGRAM_CHAT_ID">
+        </label>
+        <label>Bot ID
+          <input id="botId" placeholder="us-stocks-bot">
+        </label>
+
+        <div class="actions">
+          <button id="analyzeBtn">▶ Анализ</button>
+          <button class="secondary" id="refreshBtn">↻ Обновить</button>
+          <button class="secondary" id="testTelegramBtn">✉ Тест</button>
+          <button class="danger" id="clearLogsBtn">■ Логи</button>
+        </div>
+        <p class="hint">Secrets добавляются в Cloudflare Dashboard: Worker → Settings → Variables → Add secret. Нужны <code>WEBHOOK_TOKEN</code>, <code>TELEGRAM_BOT_TOKEN</code> или <code>TELEGRAM_BOT_TOKEN_US_STOCKS_BOT</code>.</p>
+      </aside>
+
+      <section class="workspace">
+        <div class="panel">
+          <div class="toolbar">
+            <strong>Результаты</strong>
+            <span class="pill" id="summary">Нет данных</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Тикер</th>
+                  <th>Цена</th>
+                  <th>EMA200</th>
+                  <th>AVWAP</th>
+                  <th>POC</th>
+                  <th>RSI</th>
+                  <th>Momentum</th>
+                  <th>Сигнал</th>
+                </tr>
+              </thead>
+              <tbody id="rows"><tr><td colspan="8" class="empty">Запустите анализ</td></tr></tbody>
+            </table>
+          </div>
+          <div class="toast" id="toast"></div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <strong>Логи запросов</strong>
+            <span class="pill" id="logCount">0 записей</span>
+          </div>
+          <div class="logs" id="requestLogs"><div class="empty">Пока запросов нет</div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+    }[char]));
+    const saved = JSON.parse(localStorage.getItem("scannerMonitor") || "{}");
+    ["apiBase", "apiToken", "telegramChatId", "botId"].forEach((id) => {
+      if (saved[id]) $(id).value = saved[id];
+    });
+
+    function saveLocal() {
+      localStorage.setItem("scannerMonitor", JSON.stringify({
+        apiBase: $("apiBase").value.trim().replace(/\/+$/, ""),
+        apiToken: $("apiToken").value,
+        telegramChatId: $("telegramChatId").value.trim(),
+        botId: $("botId").value.trim(),
+      }));
+    }
+    function baseUrl() {
+      const value = $("apiBase").value.trim().replace(/\/+$/, "");
+      if (!value) throw new Error("Укажите Worker API URL");
+      return value;
+    }
+    async function api(path, options = {}) {
+      saveLocal();
+      const headers = { ...(options.headers || {}) };
+      if ($("apiToken").value) headers["X-Scanner-Token"] = $("apiToken").value;
+      const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Ошибка запроса");
+      return data;
+    }
+    function payload() {
+      return {
+        source: "cloudflare_pages_monitor",
+        telegramChatId: $("telegramChatId").value.trim() || undefined,
+        bot: { id: $("botId").value.trim() || undefined },
+        tickers: $("tickers").value,
+        analysis: {
+          timeframe: $("timeframe").value,
+          risk: Number($("risk").value || 1),
+          strategies: [...document.querySelectorAll("input[name=strategy]:checked")].map((el) => el.value),
+        },
+      };
+    }
+    function setBusy(busy) {
+      ["analyzeBtn", "refreshBtn", "testTelegramBtn", "clearLogsBtn"].forEach((id) => $(id).disabled = busy);
+    }
+    function renderStatus(state) {
+      $("workerState").textContent = state.worker || (state.ok ? "online" : "-");
+      $("environment").textContent = state.environment || "-";
+      $("updatedAt").textContent = state.time || "-";
+      renderLogs(state.logs || []);
+    }
+    function renderLogs(logs) {
+      $("logCount").textContent = `${logs.length} записей`;
+      $("requestLogs").innerHTML = logs.length ? logs.map((log) => `
+        <div class="log-row">
+          <span>${esc(log.time || "-")}</span>
+          <div>
+            <strong>${esc(log.action || "-")} · ${esc(log.status || "-")}</strong><br>
+            <span>Откуда: ${esc(log.origin || "-")}</span><br>
+            <span>Тикеры: ${esc(log.tickers || "-")}</span>
+            ${log.detail ? `<br><span>Детали: ${esc(log.detail)}</span>` : ""}
+          </div>
+        </div>
+      `).join("") : `<div class="empty">Пока запросов нет</div>`;
+    }
+    function renderResult(result) {
+      const rows = result.rows || [];
+      $("summary").textContent = `${rows.length} тикеров · ${result.timeframe || "-"}`;
+      $("rows").innerHTML = rows.length ? rows.map((row) => {
+        const change = Number(row.change || 0);
+        const changePercent = Number(row.change_percent || 0);
+        const signalText = row.signals.length
+          ? row.signals.map((s) => `<span class="${s.side === "long" ? "long" : "short"}">${esc(s.side).toUpperCase()} · ${esc(s.strategy)}</span>`).join("<br>")
+          : `<span class="none">нет</span>`;
+        return `<tr>
+          <td class="ticker">${esc(row.ticker)}</td>
+          <td>${esc(row.price ?? "-")}<br><span class="none">${change > 0 ? "+" : ""}${change.toFixed(2)} (${changePercent > 0 ? "+" : ""}${changePercent.toFixed(2)}%)</span></td>
+          <td>${esc(row.ema200 ?? "-")}</td>
+          <td>${esc(row.avwap ?? "-")}</td>
+          <td>${esc(row.poc ?? "-")}</td>
+          <td>${esc(row.rsi14 ?? "-")}</td>
+          <td>${esc(row.roc20 ?? "-")}%</td>
+          <td>${signalText}</td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="8" class="empty">Нет данных</td></tr>`;
+      $("toast").textContent = (result.errors || []).map((error) => `${error.ticker}: ${error.error}`).join(" · ");
+    }
+    async function refresh() {
+      const state = await api("/api/status");
+      renderStatus(state);
+    }
+    $("refreshBtn").addEventListener("click", async () => {
+      setBusy(true);
+      try { await refresh(); } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
+    });
+    $("analyzeBtn").addEventListener("click", async () => {
+      setBusy(true);
+      $("toast").textContent = "Идет анализ...";
+      try {
+        renderResult(await api("/api/external/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload()),
+        }));
+        await refresh();
+      } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
+    });
+    $("testTelegramBtn").addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        const result = await api("/api/test-telegram", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload()),
+        });
+        $("toast").textContent = result.message;
+        await refresh();
+      } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
+    });
+    $("clearLogsBtn").addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        await api("/api/clear-logs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: $("apiToken").value }),
+        });
+        await refresh();
+        $("toast").textContent = "Логи очищены";
+      } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
+    });
+    refresh().catch((error) => { $("toast").textContent = error.message; });
+    setInterval(() => refresh().catch(() => {}), 5000);
+  </script>
+</body>
+</html>

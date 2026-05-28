@@ -449,7 +449,7 @@ news-2026-05-27-us-001
 
 ## Current Implementation Note
 
-Current Cloudflare Worker already accepts:
+Cloudflare Worker accepts:
 
 - `ticker`
 - `tickers`
@@ -457,9 +457,25 @@ Current Cloudflare Worker already accepts:
 - `timeframe`
 - `risk`
 - `strategies`
+- `country`
+- `bot`
+- `news`
+- object-style `tickers[].symbol`
+- `analysis.timeframe`
+- `analysis.risk`
+- `analysis.anchorBars`
+- `analysis.strategies`
+- `delivery.sendToTelegram`
 
-Next implementation step:
+When a request contains `news`, the Worker:
 
-- accept `country`, `bot`, `news`, and object-style `tickers[].symbol`;
-- store news and ticker links in D1;
-- send Telegram messages in strict order: news first, then analysis and signals.
+- stores `country`, `bot`, `news_items`, and `news_tickers` in D1 when the database binding is available;
+- sends the Telegram news message first;
+- sends the analysis report second;
+- returns the same JSON analysis result with `requestId`, `country`, `bot`, and `news` echoed back for tracing.
+
+Telegram bot token resolution:
+
+1. `bot.tokenSecretName` if provided.
+2. `TELEGRAM_BOT_TOKEN_<BOT_ID>` where non-alphanumeric characters in `bot.id` become `_`.
+3. `TELEGRAM_BOT_TOKEN`.
