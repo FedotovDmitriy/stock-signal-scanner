@@ -1,0 +1,52 @@
+
+--- 2026-05-28T18:50:39.488Z debug
+🪵  Writing logs to "C:\Users\fnemo\Desktop\Trade\stock-signal-scanner\.wrangler-logs\wrangler-2026-05-28_18-50-39_392.log"
+---
+
+--- 2026-05-28T18:50:39.488Z debug
+Metrics dispatcher: Posting data {"deviceId":"ba759bef-6300-4a8d-8383-ebdc57fd68a5","event":"wrangler command started","timestamp":1779994239488,"properties":{"amplitude_session_id":1779994239478,"amplitude_event_id":0,"wranglerVersion":"3.114.14","osPlatform":"Windows","osVersion":"Windows 11 Pro","nodeVersion":24,"packageManager":"npm","isFirstUsage":true,"configFileType":"toml","isCI":false,"isPagesCI":false,"isWorkersCI":false,"isInteractive":false,"hasAssets":false,"argsUsed":["compatibilityDate","j","name"],"argsCombination":"compatibilityDate, j, name","command":"wrangler deploy","args":{"name":"<REDACTED>","compatibilityDate":"<REDACTED>","bundle":false,"xJsonConfig":true,"j":true,"noBundle":false,"latest":false,"keepVars":false,"xAutoCreate":true,"script":"<REDACTED>"}}}
+---
+
+--- 2026-05-28T18:50:39.499Z debug
+.env file not found at ".env". Continuing... For more details, refer to https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
+---
+
+--- 2026-05-28T18:50:39.531Z log
+
+ ⛅️ wrangler 3.114.14 (update available 4.95.0)
+-----------------------------------------------
+
+---
+
+--- 2026-05-28T18:50:39.591Z warn
+▲ [WARNING] The version of Wrangler you are using is now out-of-date.
+
+  Please update to the latest version to prevent critical errors.
+  Run `npm install --save-dev wrangler@4` to update to the latest version.
+  After installation, run Wrangler with `npx wrangler`.
+
+
+---
+
+--- 2026-05-28T18:50:39.631Z log
+
+---
+
+--- 2026-05-28T18:50:39.633Z error
+X [ERROR] Build failed with 1 error:
+
+  X [ERROR] Cannot read directory "../../..": Access is denied.
+  
+  
+
+
+---
+
+--- 2026-05-28T18:50:39.634Z log
+
+Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more at https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler/telemetry.md
+---
+
+--- 2026-05-28T18:50:39.636Z debug
+Metrics dispatcher: Posting data {"deviceId":"ba759bef-6300-4a8d-8383-ebdc57fd68a5","event":"wrangler command errored","timestamp":1779994239636,"properties":{"amplitude_session_id":1779994239478,"amplitude_event_id":1,"wranglerVersion":"3.114.14","osPlatform":"Windows","osVersion":"Windows 11 Pro","nodeVersion":24,"packageManager":"npm","isFirstUsage":false,"configFileType":"toml","isCI":false,"isPagesCI":false,"isWorkersCI":false,"isInteractive":false,"hasAssets":false,"argsUsed":["compatibilityDate","j","name"],"argsCombination":"compatibilityDate, j, name","command":"wrangler deploy","args":{"name":"<REDACTED>","compatibilityDate":"<REDACTED>","bundle":false,"xJsonConfig":true,"j":true,"noBundle":false,"latest":false,"keepVars":false,"xAutoCreate":true,"script":"<REDACTED>"},"durationMs":173,"durationSeconds":0.173,"durationMinutes":0.0028833333333333332,"errorType":"BuildFailure"}}
+---

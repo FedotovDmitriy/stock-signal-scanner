@@ -206,28 +206,28 @@ function analyzeTicker(ticker, candles, config) {
   const signals = [];
 
   if (config.strategies.includes("trend") && ema200 && price > ema200 && price > avwap) {
-    signals.push(makeSignal(ticker, "Trend Following", "long", price, "Ñ†ÐµÐ½Ð° Ð²Ñ‹ÑˆÐµ EMA200 Ð¸ Ð²Ñ‹ÑˆÐµ AVWAP", "Ð²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ñ‹Ð¹ long", price - atr * 2, price + atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Trend Following", "long", price, "цена выше EMA200 и выше AVWAP", "возможный long", price - atr * 2, price + atr * 3, config.risk));
   }
   if (config.strategies.includes("trend") && ema200 && price < ema200 && price < avwap) {
-    signals.push(makeSignal(ticker, "Trend Following", "short", price, "Ñ†ÐµÐ½Ð° Ð½Ð¸Ð¶Ðµ EMA200 Ð¸ Ð½Ð¸Ð¶Ðµ AVWAP", "Ð²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ñ‹Ð¹ short", price + atr * 2, price - atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Trend Following", "short", price, "цена ниже EMA200 и ниже AVWAP", "возможный short", price + atr * 2, price - atr * 3, config.risk));
   }
   if (config.strategies.includes("breakout") && price > high20) {
-    signals.push(makeSignal(ticker, "Breakout Trading", "long", price, "Ð¿Ñ€Ð¾Ð±Ð¾Ð¹ 20-ÑÐ²ÐµÑ‡Ð½Ð¾Ð³Ð¾ Ð¼Ð°ÐºÑÐ¸Ð¼ÑƒÐ¼Ð°", "Ð¸Ð¼Ð¿ÑƒÐ»ÑŒÑÐ½Ñ‹Ð¹ long", price - atr * 1.8, price + atr * 3.2, config.risk));
+    signals.push(makeSignal(ticker, "Breakout Trading", "long", price, "пробой 20-свечного максимума", "импульсный long", price - atr * 1.8, price + atr * 3.2, config.risk));
   }
   if (config.strategies.includes("breakout") && price < low20) {
-    signals.push(makeSignal(ticker, "Breakout Trading", "short", price, "Ð¿Ñ€Ð¾Ð±Ð¾Ð¹ 20-ÑÐ²ÐµÑ‡Ð½Ð¾Ð³Ð¾ Ð¼Ð¸Ð½Ð¸Ð¼ÑƒÐ¼Ð°", "Ð¸Ð¼Ð¿ÑƒÐ»ÑŒÑÐ½Ñ‹Ð¹ short", price + atr * 1.8, price - atr * 3.2, config.risk));
+    signals.push(makeSignal(ticker, "Breakout Trading", "short", price, "пробой 20-свечного минимума", "импульсный short", price + atr * 1.8, price - atr * 3.2, config.risk));
   }
   if (config.strategies.includes("volume_avwap") && price > avwap && price > poc) {
-    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "long", price, "Ñ†ÐµÐ½Ð° Ð²Ñ‹ÑˆÐµ AVWAP Ð¸ Ð²Ñ‹ÑˆÐµ POC", "Ð¿Ð¾ÐºÑƒÐ¿Ð°Ñ‚ÐµÐ»Ð¸ ÑƒÐ´ÐµÑ€Ð¶Ð¸Ð²Ð°ÑŽÑ‚ ÐºÐ¾Ð½Ñ‚Ñ€Ð¾Ð»ÑŒ", Math.min(avwap, poc), price + atr * 2.5, config.risk));
+    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "long", price, "цена выше AVWAP и выше POC", "покупатели удерживают контроль", Math.min(avwap, poc), price + atr * 2.5, config.risk));
   }
   if (config.strategies.includes("volume_avwap") && price < avwap && price < poc) {
-    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "short", price, "Ñ†ÐµÐ½Ð° Ð½Ð¸Ð¶Ðµ AVWAP Ð¸ Ð½Ð¸Ð¶Ðµ POC", "Ð¿Ñ€Ð¾Ð´Ð°Ð²Ñ†Ñ‹ ÑƒÐ´ÐµÑ€Ð¶Ð¸Ð²Ð°ÑŽÑ‚ ÐºÐ¾Ð½Ñ‚Ñ€Ð¾Ð»ÑŒ", Math.max(avwap, poc), price - atr * 2.5, config.risk));
+    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "short", price, "цена ниже AVWAP и ниже POC", "продавцы удерживают контроль", Math.max(avwap, poc), price - atr * 2.5, config.risk));
   }
   if (config.strategies.includes("momentum") && roc20 > 5 && rsi > 55) {
-    signals.push(makeSignal(ticker, "Momentum Trading", "long", price, `ROC20 ${roc20.toFixed(1)}% Ð¸ RSI14 ${rsi.toFixed(0)}`, "Ð¼Ð¾Ð¼ÐµÐ½Ñ‚ÑƒÐ¼ ÑƒÑÐ¸Ð»Ð¸Ð²Ð°ÐµÑ‚ÑÑ", price - atr * 2, price + atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Momentum Trading", "long", price, `ROC20 ${roc20.toFixed(1)}% и RSI14 ${rsi.toFixed(0)}`, "моментум усиливается", price - atr * 2, price + atr * 3, config.risk));
   }
   if (config.strategies.includes("momentum") && roc20 < -5 && rsi < 45) {
-    signals.push(makeSignal(ticker, "Momentum Trading", "short", price, `ROC20 ${roc20.toFixed(1)}% Ð¸ RSI14 ${rsi.toFixed(0)}`, "Ð¼Ð¾Ð¼ÐµÐ½Ñ‚ÑƒÐ¼ Ð²Ð½Ð¸Ð· ÑƒÑÐ¸Ð»Ð¸Ð²Ð°ÐµÑ‚ÑÑ", price + atr * 2, price - atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Momentum Trading", "short", price, `ROC20 ${roc20.toFixed(1)}% и RSI14 ${rsi.toFixed(0)}`, "моментум вниз усиливается", price + atr * 2, price - atr * 3, config.risk));
   }
 
   return {
@@ -264,46 +264,46 @@ function makeSignal(ticker, strategy, side, price, condition, idea, stop, target
 function analysisReportMessage(result) {
   const signalCount = countSignals(result.rows);
   const lines = [
-    "ðŸ“Š ÐžÑ‚Ñ‡Ñ‘Ñ‚ Ð°Ð½Ð°Ð»Ð¸Ð·Ð°",
-    "â”â”â”â”â”â”â”â”â”â”â”â”â”â”",
+    "📊 Отчёт анализа",
+    "━━━━━━━━━━━━━━",
     "",
-    `Ð’Ñ€ÐµÐ¼Ñ: ${result.timestamp}`,
-    `Ð¢Ð°Ð¹Ð¼Ñ„Ñ€ÐµÐ¹Ð¼: ${result.timeframe}`,
-    `Ð¢Ð¸ÐºÐµÑ€Ð¾Ð²: ${result.rows.length}`,
-    `Ð¡Ð¸Ð³Ð½Ð°Ð»Ð¾Ð²: ${signalCount}`,
+    `Время: ${result.timestamp}`,
+    `Таймфрейм: ${result.timeframe}`,
+    `Тикеров: ${result.rows.length}`,
+    `Сигналов: ${signalCount}`,
     "",
   ];
 
   for (const row of result.rows) {
-    const arrow = row.direction === "up" ? "ðŸŸ¢â¬†ï¸" : row.direction === "down" ? "ðŸ”´â¬‡ï¸" : "âšªâž¡ï¸";
+    const arrow = row.direction === "up" ? "🟢⬆️" : row.direction === "down" ? "🔴⬇️" : "⚪➡️";
     const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
-    lines.push("â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+    lines.push("━━━━━━━━━━━━━━");
     lines.push(`${arrow} ${row.ticker}`);
-    lines.push(`Ð¦ÐµÐ½Ð°: ${row.price.toFixed(2)}`);
-    lines.push(`Ð”Ð²Ð¸Ð¶ÐµÐ½Ð¸Ðµ: ${movement}`);
+    lines.push(`Цена: ${row.price.toFixed(2)}`);
+    lines.push(`Движение: ${movement}`);
     lines.push(`EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}`);
     if (row.signals.length) {
       lines.push("");
-      lines.push("âœ… Ð¡Ð¸Ð³Ð½Ð°Ð»Ñ‹:");
+      lines.push("✅ Сигналы:");
       for (const signal of row.signals) {
-        const icon = signal.side === "long" ? "ðŸ“ˆ" : "ðŸ“‰";
+        const icon = signal.side === "long" ? "📈" : "📉";
         lines.push(`${icon} ${signal.side} / ${signal.strategy}`);
-        lines.push(`Ð£ÑÐ»Ð¾Ð²Ð¸Ðµ: ${signal.condition}`);
-        lines.push(`Ð˜Ð´ÐµÑ: ${signal.idea}`);
-        lines.push(`Ð¡Ñ‚Ð¾Ð¿: ${signal.stop.toFixed(2)}`);
-        lines.push(`Ð¦ÐµÐ»ÑŒ: ${signal.target.toFixed(2)}`);
-        lines.push(`Ð Ð¸ÑÐº: ${signal.risk}%`);
+        lines.push(`Условие: ${signal.condition}`);
+        lines.push(`Идея: ${signal.idea}`);
+        lines.push(`Стоп: ${signal.stop.toFixed(2)}`);
+        lines.push(`Цель: ${signal.target.toFixed(2)}`);
+        lines.push(`Риск: ${signal.risk}%`);
       }
     } else {
       lines.push("");
-      lines.push("Ð¡Ð¸Ð³Ð½Ð°Ð»Ñ‹: Ð½ÐµÑ‚");
+      lines.push("Сигналы: нет");
     }
     lines.push("");
   }
 
   if (result.errors.length) {
-    lines.push("â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
-    lines.push("âš ï¸ ÐžÑˆÐ¸Ð±ÐºÐ¸:");
+    lines.push("━━━━━━━━━━━━━━");
+    lines.push("⚠️ Ошибки:");
     for (const error of result.errors) lines.push(`${error.ticker}: ${error.error}`);
   }
   return lines.join("\n").trim();
