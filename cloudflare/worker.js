@@ -121,9 +121,15 @@ async function handleTelegramUpdate(update, env, request) {
   const origin = telegramOrigin(message, request);
   if (!chatId || !text) return;
 
+  const reportCommand = parseTelegramReportCommand(text);
+  if (reportCommand) {
+    await handleTelegramReportCommand(reportCommand, env, chatId, origin);
+    return;
+  }
+
   const tickers = parseTelegramText(text);
   if (!tickers.length) {
-    await sendTelegram(env, chatId, "ÐÐ°Ð¿Ð¸ÑˆÐ¸Ñ‚Ðµ Ñ‚Ð¸ÐºÐµÑ€ Ð¸Ð»Ð¸ ÑÐ¿Ð¸ÑÐ¾Ðº Ñ‚Ð¸ÐºÐµÑ€Ð¾Ð²: AAPL Ð¸Ð»Ð¸ AAPL, MSFT");
+    await sendTelegram(env, chatId, "Напишите тикер или список тикеров: AAPL или AAPL, MSFT");
     return;
   }
 
@@ -136,6 +142,32 @@ async function handleTelegramUpdate(update, env, request) {
   });
   await sendTelegram(env, chatId, analysisReportMessage(result));
   await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`);
+}
+
+async function handleTelegramReportCommand(command, env, chatId, origin) {
+  if (!command.tickers.length) {
+    await sendTelegram(env, chatId, `Напишите команду с тикером, например: ${command.label} AAPL`);
+    return;
+  }
+
+  await addLog(env, origin, command.label, command.tickers.join(", "), "started", "");
+  for (const ticker of command.tickers) {
+    if (!isValidTicker(ticker)) {
+      await sendTelegram(env, chatId, `${ticker}: ${tickerValidationError(ticker)}`);
+      await addLog(env, origin, command.label, ticker, "error", tickerValidationError(ticker));
+      continue;
+    }
+
+    const result = await analyzeTickers([ticker], {
+      timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
+      strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
+      risk: Number(env.DEFAULT_RISK || 1),
+      anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+    });
+    const text = command.type === "fundrep" ? fundRepMessage(ticker, result) : promtRepMessage(ticker, result);
+    await sendTelegram(env, chatId, text);
+    await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`);
+  }
 }
 
 async function analyzeTickers(tickers, config) {
@@ -275,9 +307,8 @@ function analysisReportMessage(result) {
   ];
 
   for (const row of result.rows) {
-    const arrow = row.direction === "up" ? "🟢⬆️" : row.direction === "down" ? "🔴⬇️" : "⚪➡️";
+    const arrow = row.direction === "up" ? "🟩⬆️" : row.direction === "down" ? "🟥⬇️" : "⬜➡️";
     const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
-    lines.push("━━━━━━━━━━━━━━");
     lines.push(`${arrow} ${row.ticker}`);
     lines.push(`Цена: ${row.price.toFixed(2)}`);
     lines.push(`Движение: ${movement}`);
@@ -285,7 +316,8 @@ function analysisReportMessage(result) {
     if (row.signals.length) {
       lines.push("");
       lines.push("✅ Сигналы:");
-      for (const signal of row.signals) {
+      row.signals.forEach((signal, index) => {
+        if (index > 0) lines.push("━━━━━━━━━━━━━━");
         const icon = signal.side === "long" ? "📈" : "📉";
         lines.push(`${icon} ${signal.side} / ${signal.strategy}`);
         lines.push(`Условие: ${signal.condition}`);
@@ -293,7 +325,7 @@ function analysisReportMessage(result) {
         lines.push(`Стоп: ${signal.stop.toFixed(2)}`);
         lines.push(`Цель: ${signal.target.toFixed(2)}`);
         lines.push(`Риск: ${signal.risk}%`);
-      }
+      });
     } else {
       lines.push("");
       lines.push("Сигналы: нет");
@@ -309,18 +341,86 @@ function analysisReportMessage(result) {
   return lines.join("\n").trim();
 }
 
-function telegramSignalMessage(signal) {
-  const icon = signal.side === "long" ? "ðŸ“ˆ" : "ðŸ“‰";
-  return [
-    `${icon} Ð¡Ð¸Ð³Ð½Ð°Ð» Ð¿Ð¾ ${signal.ticker}`,
+function fundRepMessage(ticker, result) {
+  const row = result.rows[0];
+  if (!row) return reportErrorMessage("FundRep", ticker, result);
+  const trend = row.price > row.ema200 && row.price > row.avwap ? "бычий" : row.price < row.ema200 && row.price < row.avwap ? "медвежий" : "нейтральный";
+  const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
+  const bestSignals = row.signals.slice(0, 4);
+  const lines = [
+    `📘 FundRep ${ticker}`,
+    "━━━━━━━━━━━━━━",
     "",
-    `Ð¡Ñ‚Ñ€Ð°Ñ‚ÐµÐ³Ð¸Ñ: ${signal.strategy}`,
-    `Ð¦ÐµÐ½Ð°: ${signal.price.toFixed(2)}`,
-    `Ð£ÑÐ»Ð¾Ð²Ð¸Ðµ: ${signal.condition}`,
-    `Ð˜Ð´ÐµÑ: ${signal.idea}`,
-    `Ð¡Ñ‚Ð¾Ð¿: ${signal.stop.toFixed(2)}`,
-    `Ð¦ÐµÐ»ÑŒ: ${signal.target.toFixed(2)}`,
-    `Ð Ð¸ÑÐº: ${signal.risk}%`,
+    `Время: ${result.timestamp}`,
+    `Цена: ${row.price.toFixed(2)}`,
+    `Движение: ${movement}`,
+    `Тренд: ${trend}`,
+    "",
+    "Ключевые метрики:",
+    `EMA200: ${valueOrDash(row.ema200)}`,
+    `AVWAP: ${valueOrDash(row.avwap)}`,
+    `RSI: ${valueOrDash(row.rsi14)}`,
+    `ROC20: ${valueOrDash(row.roc20)}%`,
+    "",
+    "Вывод:",
+    row.signals.length ? "Есть технические сигналы, требующие проверки на новостях, отчётности и рисках компании." : "Явных технических сигналов нет; лучше ждать подтверждения тренда и объёма.",
+  ];
+  if (bestSignals.length) {
+    lines.push("", "Сигналы:");
+    bestSignals.forEach((signal, index) => {
+      if (index > 0) lines.push("━━━━━━━━━━━━━━");
+      lines.push(`${signal.side === "long" ? "📈" : "📉"} ${signal.side} / ${signal.strategy}`);
+      lines.push(`Условие: ${signal.condition}`);
+      lines.push(`Идея: ${signal.idea}`);
+      lines.push(`Стоп: ${signal.stop.toFixed(2)}`);
+      lines.push(`Цель: ${signal.target.toFixed(2)}`);
+    });
+  }
+  return lines.join("\n").trim();
+}
+
+function promtRepMessage(ticker, result) {
+  const row = result.rows[0];
+  if (!row) return reportErrorMessage("PromtRep", ticker, result);
+  return [
+    `🧠 PromtRep ${ticker}`,
+    "━━━━━━━━━━━━━━",
+    "",
+    "Скопируй этот промт в Perplexity Finance:",
+    "",
+    `Подготовь профессиональный PDF-отчёт по тикеру ${ticker}.`,
+    "Структура отчёта:",
+    "1. Income Statement: выручка, маржа, прибыль, динамика и причины изменений.",
+    "2. Momentum: тренд цены, относительная сила, RSI, объём и ключевые уровни.",
+    "3. Valuation History: мультипликаторы, сравнение с историей и сектором.",
+    "4. Capital & Conviction: баланс, долги, buybacks, insider/institutional activity.",
+    "",
+    "Текущие технические вводные:",
+    `Цена: ${row.price.toFixed(2)}`,
+    `Движение: ${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`,
+    `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%`,
+    "",
+    "Для каждого KPI объясни: что значит показатель, почему он изменился, на что влияет для инвестора и что отслеживать дальше. Итог должен выглядеть как современный аналитический dashboard с графиками, KPI-карточками и кратким инвестиционным выводом.",
+  ].join("\n").trim();
+}
+
+function reportErrorMessage(label, ticker, result) {
+  const error = result.errors[0]?.error || "не удалось получить данные";
+  return `⚠️ ${label} ${ticker}\n━━━━━━━━━━━━━━\n${error}`;
+}
+
+function telegramSignalMessage(signal) {
+  const icon = signal.side === "long" ? "📈" : "📉";
+  return [
+    `${icon} Сигнал по ${signal.ticker}`,
+    "",
+    `Стратегия: ${signal.strategy}`,
+    `Цена: ${signal.price.toFixed(2)}`,
+    `Условие: ${signal.condition}`,
+    `Идея: ${signal.idea}`,
+    `Стоп: ${signal.stop.toFixed(2)}`,
+    `Цель: ${signal.target.toFixed(2)}`,
+    `Риск: ${signal.risk}%`,
   ].join("\n");
 }
 
@@ -611,8 +711,18 @@ function parseTickers(value) {
 
 function parseTelegramText(text) {
   const cleaned = text.replace(/^\/start\b/i, "").replace(/^\/analyze\b/i, "").trim();
-  if (/^\/?(fundrep|promtrep)\b/i.test(cleaned)) return [];
   return parseTickers(cleaned);
+}
+
+function parseTelegramReportCommand(text) {
+  const match = String(text || "").trim().match(/^\/?(fundrep|promtrep)(?:@\w+)?(?:\s+(.+))?$/i);
+  if (!match) return null;
+  const type = match[1].toLowerCase();
+  return {
+    type,
+    label: type === "fundrep" ? "FundRep" : "PromtRep",
+    tickers: parseTickers(match[2] || ""),
+  };
 }
 
 function isValidTicker(ticker) {
