@@ -85,6 +85,21 @@
     textarea { min-height: 86px; resize: vertical; }
     input:focus, textarea:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(125, 211, 252, .12); }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .env-bar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+    .settings-panel {
+      display: none;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+    .settings-panel.open { display: grid; }
     .checks { display: grid; gap: 8px; }
     .check {
       display: flex;
@@ -183,14 +198,30 @@
     <main>
       <aside class="panel form">
         <div>
-          <div class="section-title">Подключение</div>
-          <label>Worker API URL
-          <input id="apiBase" placeholder="https://stock-signal-scanner-dev.example.workers.dev" value="https://stock-signal-scanner-dev.fnemoy.workers.dev">
-          </label>
+          <div class="section-title">Среда</div>
+          <div class="env-bar">
+            <label>Активная среда
+              <select id="activeEnv"></select>
+            </label>
+            <button class="secondary" id="settingsBtn" type="button">Настройки</button>
+          </div>
         </div>
-        <label>Webhook/API token
-          <input id="apiToken" type="password" autocomplete="off" placeholder="WEBHOOK_TOKEN из Worker secret">
-        </label>
+
+        <div class="settings-panel" id="settingsPanel">
+          <label>Среда для настройки
+            <select id="settingsEnv"></select>
+          </label>
+          <label>Название
+            <input id="envLabel" placeholder="Dev">
+          </label>
+          <label>Worker API URL
+            <input id="envApiBase" placeholder="https://worker.example.workers.dev">
+          </label>
+          <label>Webhook/API token
+            <input id="envApiToken" type="password" autocomplete="off" placeholder="WEBHOOK_TOKEN из Worker secret">
+          </label>
+          <button class="secondary" id="saveEnvBtn" type="button">Сохранить среду</button>
+        </div>
 
         <div>
           <div class="section-title">Анализ</div>
@@ -240,23 +271,20 @@
         <div class="panel">
           <div class="toolbar">
             <strong>Результаты</strong>
-            <span class="pill" id="summary">Нет данных</span>
+            <span class="pill" id="summary">Нет запросов</span>
           </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Тикер</th>
-                  <th>Цена</th>
-                  <th>EMA200</th>
-                  <th>AVWAP</th>
-                  <th>POC</th>
-                  <th>RSI</th>
-                  <th>Momentum</th>
-                  <th>Сигнал</th>
+                  <th>Время</th>
+                  <th>Действие</th>
+                  <th>Тикеры</th>
+                  <th>Статус</th>
+                  <th>Детали</th>
                 </tr>
               </thead>
-              <tbody id="rows"><tr><td colspan="8" class="empty">Запустите анализ</td></tr></tbody>
+              <tbody id="rows"><tr><td colspan="5" class="empty">Пока нет завершённых запросов</td></tr></tbody>
             </table>
           </div>
           <div class="toast" id="toast"></div>
@@ -275,33 +303,71 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const DEFAULT_API_BASE = "https://stock-signal-scanner-dev.fnemoy.workers.dev";
+    const DEFAULT_ENVS = {
+      dev: {
+        label: "Dev",
+        apiBase: "https://stock-signal-scanner-dev.fnemoy.workers.dev",
+        apiToken: "",
+      },
+      prod: {
+        label: "Prod",
+        apiBase: "",
+        apiToken: "",
+      },
+      custom: {
+        label: "Custom",
+        apiBase: "",
+        apiToken: "",
+      },
+    };
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     }[char]));
     const saved = JSON.parse(localStorage.getItem("scannerMonitor") || "{}");
-    ["apiBase", "apiToken", "telegramChatId", "botId"].forEach((id) => {
+    const environments = { ...DEFAULT_ENVS, ...(saved.environments || {}) };
+    let activeEnv = saved.activeEnv || "dev";
+    ["telegramChatId", "botId"].forEach((id) => {
       if (saved[id]) $(id).value = saved[id];
     });
-    if (!$("apiBase").value.trim()) $("apiBase").value = DEFAULT_API_BASE;
+
+    function envOptions() {
+      return Object.entries(environments).map(([key, env]) => `<option value="${esc(key)}">${esc(env.label || key)}</option>`).join("");
+    }
+    function currentEnv() {
+      return environments[activeEnv] || environments.dev;
+    }
+    function renderEnvControls() {
+      $("activeEnv").innerHTML = envOptions();
+      $("settingsEnv").innerHTML = envOptions();
+      $("activeEnv").value = activeEnv;
+      $("settingsEnv").value = activeEnv;
+      renderEnvSettings();
+    }
+    function renderEnvSettings() {
+      const key = $("settingsEnv").value || activeEnv;
+      const env = environments[key] || {};
+      $("envLabel").value = env.label || key;
+      $("envApiBase").value = env.apiBase || "";
+      $("envApiToken").value = env.apiToken || "";
+    }
 
     function saveLocal() {
       localStorage.setItem("scannerMonitor", JSON.stringify({
-        apiBase: $("apiBase").value.trim().replace(/\/+$/, ""),
-        apiToken: $("apiToken").value,
+        activeEnv,
+        environments,
         telegramChatId: $("telegramChatId").value.trim(),
         botId: $("botId").value.trim(),
       }));
     }
     function baseUrl() {
-      const value = $("apiBase").value.trim().replace(/\/+$/, "");
-      if (!value) throw new Error("Укажите Worker API URL");
+      const value = String(currentEnv().apiBase || "").trim().replace(/\/+$/, "");
+      if (!value) throw new Error("Укажите Worker API URL в настройках выбранной среды");
       return value;
     }
     async function api(path, options = {}) {
       saveLocal();
       const headers = { ...(options.headers || {}) };
-      if ($("apiToken").value) headers["X-Scanner-Token"] = $("apiToken").value;
+      if (currentEnv().apiToken) headers["X-Scanner-Token"] = currentEnv().apiToken;
       const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Ошибка запроса");
@@ -325,9 +391,23 @@
     }
     function renderStatus(state) {
       $("workerState").textContent = state.worker || (state.ok ? "online" : "-");
-      $("environment").textContent = state.environment || "-";
+      $("environment").textContent = `${currentEnv().label || activeEnv} · ${state.environment || "-"}`;
       $("updatedAt").textContent = state.time || "-";
+      renderResultLogs(state.logs || []);
       renderLogs(state.logs || []);
+    }
+    function renderResultLogs(logs) {
+      const completed = logs.filter((log) => log.status && log.status !== "started").slice(0, 12);
+      $("summary").textContent = completed.length ? `${completed.length} последних` : "Нет запросов";
+      $("rows").innerHTML = completed.length ? completed.map((log) => `
+        <tr>
+          <td>${esc(log.time || "-")}</td>
+          <td>${esc(log.action || "-")}</td>
+          <td class="ticker">${esc(log.tickers || "-")}</td>
+          <td><span class="${log.status === "ok" ? "long" : log.status === "error" ? "short" : "none"}">${esc(log.status || "-")}</span></td>
+          <td>${esc(log.detail || "-")}</td>
+        </tr>
+      `).join("") : `<tr><td colspan="5" class="empty">Пока нет завершённых запросов</td></tr>`;
     }
     function renderLogs(logs) {
       $("logCount").textContent = `${logs.length} записей`;
@@ -343,32 +423,33 @@
         </div>
       `).join("") : `<div class="empty">Пока запросов нет</div>`;
     }
-    function renderResult(result) {
-      const rows = result.rows || [];
-      $("summary").textContent = `${rows.length} тикеров · ${result.timeframe || "-"}`;
-      $("rows").innerHTML = rows.length ? rows.map((row) => {
-        const change = Number(row.change || 0);
-        const changePercent = Number(row.change_percent || 0);
-        const signalText = row.signals.length
-          ? row.signals.map((s) => `<span class="${s.side === "long" ? "long" : "short"}">${esc(s.side).toUpperCase()} · ${esc(s.strategy)}</span>`).join("<br>")
-          : `<span class="none">нет</span>`;
-        return `<tr>
-          <td class="ticker">${esc(row.ticker)}</td>
-          <td>${esc(row.price ?? "-")}<br><span class="none">${change > 0 ? "+" : ""}${change.toFixed(2)} (${changePercent > 0 ? "+" : ""}${changePercent.toFixed(2)}%)</span></td>
-          <td>${esc(row.ema200 ?? "-")}</td>
-          <td>${esc(row.avwap ?? "-")}</td>
-          <td>${esc(row.poc ?? "-")}</td>
-          <td>${esc(row.rsi14 ?? "-")}</td>
-          <td>${esc(row.roc20 ?? "-")}%</td>
-          <td>${signalText}</td>
-        </tr>`;
-      }).join("") : `<tr><td colspan="8" class="empty">Нет данных</td></tr>`;
-      $("toast").textContent = (result.errors || []).map((error) => `${error.ticker}: ${error.error}`).join(" · ");
-    }
     async function refresh() {
       const state = await api("/api/status");
       renderStatus(state);
     }
+    $("settingsBtn").addEventListener("click", () => {
+      $("settingsPanel").classList.toggle("open");
+    });
+    $("activeEnv").addEventListener("change", async () => {
+      activeEnv = $("activeEnv").value;
+      $("settingsEnv").value = activeEnv;
+      renderEnvSettings();
+      saveLocal();
+      try { await refresh(); } catch (error) { $("toast").textContent = error.message; }
+    });
+    $("settingsEnv").addEventListener("change", renderEnvSettings);
+    $("saveEnvBtn").addEventListener("click", async () => {
+      const key = $("settingsEnv").value || activeEnv;
+      environments[key] = {
+        label: $("envLabel").value.trim() || key,
+        apiBase: $("envApiBase").value.trim().replace(/\/+$/, ""),
+        apiToken: $("envApiToken").value,
+      };
+      activeEnv = key;
+      renderEnvControls();
+      saveLocal();
+      try { await refresh(); $("toast").textContent = "Среда сохранена"; } catch (error) { $("toast").textContent = error.message; }
+    });
     $("refreshBtn").addEventListener("click", async () => {
       setBusy(true);
       try { await refresh(); } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
@@ -377,11 +458,11 @@
       setBusy(true);
       $("toast").textContent = "Идет анализ...";
       try {
-        renderResult(await api("/api/external/analyze", {
+        await api("/api/external/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload()),
-        }));
+        });
         await refresh();
       } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
     });
@@ -403,12 +484,13 @@
         await api("/api/clear-logs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: $("apiToken").value }),
+          body: JSON.stringify({ token: currentEnv().apiToken }),
         });
         await refresh();
         $("toast").textContent = "Логи очищены";
       } catch (error) { $("toast").textContent = error.message; } finally { setBusy(false); }
     });
+    renderEnvControls();
     refresh().catch((error) => { $("toast").textContent = error.message; });
     setInterval(() => refresh().catch(() => {}), 5000);
   </script>
