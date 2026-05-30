@@ -1,0 +1,43 @@
+
+--- 2026-05-30T12:29:31.830Z debug
+🪵  Writing logs to "C:\Users\fnemo\Desktop\Trade\stock-signal-scanner\.wrangler-logs\wrangler-2026-05-30_12-29-31_659.log"
+---
+
+--- 2026-05-30T12:29:31.830Z debug
+Metrics dispatcher: Posting data {"deviceId":"ba759bef-6300-4a8d-8383-ebdc57fd68a5","event":"wrangler command started","timestamp":1780144171830,"properties":{"amplitude_session_id":1780144171827,"amplitude_event_id":0,"wranglerVersion":"3.114.14","osPlatform":"Windows","osVersion":"Windows 11 Pro","nodeVersion":24,"packageManager":"npm","isFirstUsage":false,"configFileType":"toml","isCI":false,"isPagesCI":false,"isWorkersCI":false,"isInteractive":false,"hasAssets":false,"argsUsed":["branch","j","projectName"],"argsCombination":"branch, j, projectName","command":"wrangler pages deploy","args":{"projectName":"<REDACTED>","branch":"<REDACTED>","xJsonConfig":true,"j":true,"uploadSourceMaps":false,"directory":"<REDACTED>"}}}
+---
+
+--- 2026-05-30T12:29:31.839Z debug
+.env file not found at ".env". Continuing... For more details, refer to https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
+---
+
+--- 2026-05-30T12:29:32.991Z warn
+▲ [WARNING] Pages now has wrangler.toml support.
+
+  We detected a configuration file at C:\Users\fnemo\Desktop\Trade\stock-signal-scanner\wrangler.toml but it is missing the "pages_build_output_dir" field, required by Pages.
+  If you would like to use this configuration file to deploy your project, please use "pages_build_output_dir" to specify the directory of static files to upload.
+  Ignoring configuration file for now, and proceeding with project deploy.
+
+
+---
+
+--- 2026-05-30T12:29:33.019Z log
+
+---
+
+--- 2026-05-30T12:29:33.020Z error
+X [ERROR] In a non-interactive environment, it's necessary to set a CLOUDFLARE_API_TOKEN environment variable for wrangler to work. Please go to https://developers.cloudflare.com/fundamentals/api/get-started/create-token/ for instructions on how to create an api token, and assign its value to CLOUDFLARE_API_TOKEN.
+
+
+---
+
+--- 2026-05-30T12:29:33.027Z debug
+Error: In a non-interactive environment, it's necessary to set a CLOUDFLARE_API_TOKEN environment variable for wrangler to work. Please go to https://developers.cloudflare.com/fundamentals/api/get-started/create-token/ for instructions on how to create an api token, and assign its value to CLOUDFLARE_API_TOKEN.
+    at requireAuth (C:\Users\fnemo\Desktop\Trade\stock-signal-scanner\.npm-cache\_npx\cbc269d8aa9ac91f\node_modules\wrangler\wrangler-dist\cli.js:92865:13)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async Object.Handler [as handler] (C:\Users\fnemo\Desktop\Trade\stock-signal-scanner\.npm-cache\_npx\cbc269d8aa9ac91f\node_modules\wrangler\wrangler-dist\cli.js:126728:21)
+---
+
+--- 2026-05-30T12:29:33.028Z debug
+Metrics dispatcher: Posting data {"deviceId":"ba759bef-6300-4a8d-8383-ebdc57fd68a5","event":"wrangler command errored","timestamp":1780144173028,"properties":{"amplitude_session_id":1780144171827,"amplitude_event_id":1,"wranglerVersion":"3.114.14","osPlatform":"Windows","osVersion":"Windows 11 Pro","nodeVersion":24,"packageManager":"npm","isFirstUsage":false,"configFileType":"toml","isCI":false,"isPagesCI":false,"isWorkersCI":false,"isInteractive":false,"hasAssets":false,"argsUsed":["branch","j","projectName"],"argsCombination":"branch, j, projectName","command":"wrangler pages deploy","args":{"projectName":"<REDACTED>","branch":"<REDACTED>","xJsonConfig":true,"j":true,"uploadSourceMaps":false,"directory":"<REDACTED>"},"durationMs":1217,"durationSeconds":1.217,"durationMinutes":0.020283333333333334,"errorType":"UserError"}}
+---

@@ -185,7 +185,7 @@
         <div>
           <div class="section-title">Подключение</div>
           <label>Worker API URL
-            <input id="apiBase" placeholder="https://stock-signal-scanner-dev.example.workers.dev">
+          <input id="apiBase" placeholder="https://stock-signal-scanner-dev.example.workers.dev" value="https://stock-signal-scanner-dev.fnemoy.workers.dev">
           </label>
         </div>
         <label>Webhook/API token
@@ -275,6 +275,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
+    const DEFAULT_API_BASE = "https://stock-signal-scanner-dev.fnemoy.workers.dev";
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     }[char]));
@@ -282,6 +283,7 @@
     ["apiBase", "apiToken", "telegramChatId", "botId"].forEach((id) => {
       if (saved[id]) $(id).value = saved[id];
     });
+    if (!$("apiBase").value.trim()) $("apiBase").value = DEFAULT_API_BASE;
 
     function saveLocal() {
       localStorage.setItem("scannerMonitor", JSON.stringify({

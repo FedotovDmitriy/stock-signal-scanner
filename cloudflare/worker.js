@@ -164,8 +164,12 @@ async function handleTelegramReportCommand(command, env, chatId, origin) {
       risk: Number(env.DEFAULT_RISK || 1),
       anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
     });
-    const text = command.type === "fundrep" ? fundRepMessage(ticker, result) : promtRepMessage(ticker, result);
-    await sendTelegram(env, chatId, text);
+    if (command.type === "fundrep") {
+      const html = fundRepHtml(ticker, result);
+      await sendTelegramDocument(env, chatId, `fundrep_${ticker}_${compactTimestamp(result.timestamp)}.html`, html, `FundRep ${ticker}: фундаментальный отчёт.`);
+    } else {
+      await sendTelegram(env, chatId, promtRepMessage(ticker, result));
+    }
     await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`);
   }
 }
@@ -294,15 +298,9 @@ function makeSignal(ticker, strategy, side, price, condition, idea, stop, target
 }
 
 function analysisReportMessage(result) {
-  const signalCount = countSignals(result.rows);
   const lines = [
     "📊 Отчёт анализа",
     "━━━━━━━━━━━━━━",
-    "",
-    `Время: ${result.timestamp}`,
-    `Таймфрейм: ${result.timeframe}`,
-    `Тикеров: ${result.rows.length}`,
-    `Сигналов: ${signalCount}`,
     "",
   ];
 
@@ -412,6 +410,174 @@ function fundRepMessage(ticker, result) {
   return lines.join("\n").trim();
 }
 
+function fundRepHtml(ticker, result) {
+  const row = result.rows[0];
+  if (!row) {
+    return `<!doctype html><meta charset="utf-8"><title>FundRep ${escapeHtml(ticker)}</title><body><pre>${escapeHtml(reportErrorMessage("FundRep", ticker, result))}</pre></body>`;
+  }
+
+  const sections = fundRepSections(ticker, row);
+  const sectionHtml = sections.map((section) => `
+    <section>
+      <h2>${escapeHtml(section.title)}</h2>
+      <p class="question">${escapeHtml(section.question)}</p>
+      <table>
+        <thead><tr><th>Метрика</th><th>Значение</th><th>Объяснение</th></tr></thead>
+        <tbody>
+          ${section.metrics.map((metric) => `<tr><td>${escapeHtml(metric[0])}</td><td>${escapeHtml(metric[1])}</td><td>${escapeHtml(metric[2])}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </section>
+  `).join("");
+
+  return `<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>FundRep ${escapeHtml(ticker)}</title>
+  <style>
+    @page { size: A4; margin: 14mm; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #111827;
+      font-family: Arial, "Segoe UI", sans-serif;
+      font-size: 11.5px;
+      line-height: 1.45;
+      background: #fff;
+    }
+    h1 {
+      margin: 0 0 8px;
+      padding-bottom: 10px;
+      border-bottom: 3px solid #2563eb;
+      font-size: 25px;
+      line-height: 1.15;
+    }
+    .meta {
+      margin: 0 0 16px;
+      color: #4b5563;
+      font-size: 10.5px;
+    }
+    h2 {
+      margin: 18px 0 5px;
+      color: #1d4ed8;
+      font-size: 16px;
+      break-after: avoid;
+    }
+    .question {
+      margin: 0 0 8px;
+      color: #374151;
+      font-weight: 700;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0 0 10px;
+      break-inside: avoid;
+    }
+    th, td {
+      border: 1px solid #d1d5db;
+      padding: 6px 7px;
+      vertical-align: top;
+    }
+    th {
+      background: #eff6ff;
+      color: #1d4ed8;
+      text-align: left;
+      font-size: 10.5px;
+    }
+    td:first-child { width: 30%; font-weight: 700; }
+    td:nth-child(2) { width: 18%; white-space: nowrap; }
+    .note {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      background: #f9fafb;
+      color: #374151;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <h1>FundRep: фундаментальный отчёт по ${escapeHtml(ticker)}</h1>
+  <p class="meta">Дата: ${escapeHtml(result.timestamp)} · Не является инвестиционной рекомендацией.</p>
+  ${sectionHtml}
+  <div class="note">Короткая шпаргалка: Profitability отвечает на вопрос о качестве прибыли; Valuation — о цене; Cash Flow — о реальных деньгах; Financial Health — о прочности баланса; Forward Signals — об ожиданиях рынка.</div>
+</body>
+</html>`;
+}
+
+function fundRepSections(ticker, row) {
+  const na = "н/д";
+  const price = `${row.price.toFixed(2)} USD`;
+  const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
+  return [
+    {
+      title: "1. Profitability / Прибыльность",
+      question: "Компания реально зарабатывает деньги и становится ли бизнес эффективнее?",
+      metrics: [
+        ["Компания", ticker, `Тикер: ${ticker}. Сектор: ${na}. Индустрия: ${na}.`],
+        ["Текущая цена", price, "Рыночная цена нужна как отправная точка для сравнения с фундаментальными метриками."],
+        ["Revenue Growth / Рост выручки", na, "Показывает темп роста верхней строки. Ускорение роста обычно поддерживает оценку компании."],
+        ["Gross Margin / Валовая маржа", na, "Показывает ценовую силу продукта и эффективность себестоимости."],
+        ["Operating Margin / Операционная маржа", na, "Показывает прибыльность основного бизнеса после операционных расходов."],
+        ["Net Margin / Чистая маржа", na, "Показывает, сколько прибыли остаётся акционерам после всех расходов."],
+        ["EPS / Прибыль на акцию", na, "EPS показывает прибыль, приходящуюся на одну акцию."],
+        ["EBITDA", na, "Грубая оценка операционной денежной генерации до процентов, налогов и амортизации."],
+      ],
+    },
+    {
+      title: "2. Valuation / Оценка стоимости",
+      question: "Хорошая ли это компания по разумной цене, или рынок уже заложил слишком много ожиданий?",
+      metrics: [
+        ["Market Cap / Капитализация", na, "Размер компании на рынке. Важно сравнивать с выручкой, прибылью и денежным потоком."],
+        ["P/E / Цена к прибыли", na, "Показывает, сколько инвестор платит за доллар текущей прибыли."],
+        ["Forward P/E / Будущий P/E", na, "Использует ожидаемую прибыль и полезен для растущих компаний, но зависит от прогнозов."],
+        ["P/S / Цена к выручке", na, "Особенно полезен для компаний, где прибыль пока нестабильна."],
+        ["EV / EBITDA", na, "Сравнивает стоимость предприятия с EBITDA и учитывает долг."],
+        ["PEG Ratio", na, "Сравнивает P/E с темпом роста прибыли. Ниже 1 часто выглядит интереснее, но не является автоматическим сигналом."],
+        ["P/B / Цена к балансовой стоимости", na, "Полезно для банков, страховых и капиталоёмких бизнесов."],
+      ],
+    },
+    {
+      title: "3. Cash Flow / Денежный поток",
+      question: "Настоящая ли прибыль, и превращается ли бизнес в реальные свободные деньги?",
+      metrics: [
+        ["Operating Cash Flow / OCF", na, "Деньги, которые компания генерирует основной деятельностью."],
+        ["Free Cash Flow / FCF", na, "Деньги после капитальных расходов, доступные для buybacks, дивидендов, долга или роста."],
+        ["FCF Margin", na, "FCF margin = FCF / выручка. Если данных выручки недостаточно, показатель нужно досчитать из отчётности."],
+        ["FCF Yield", na, "FCF yield = FCF / market cap. Помогает понять доходность свободного денежного потока относительно цены компании."],
+      ],
+    },
+    {
+      title: "4. Financial Health / Финансовое здоровье",
+      question: "Компания выдержит спад и сможет финансировать рост без разрушения баланса?",
+      metrics: [
+        ["Debt-to-Equity / D/E", na, "Показывает финансовый рычаг и риск зависимости от долга."],
+        ["Total Cash / Денежные средства", na, "Запас ликвидности для кризиса, инвестиций, buybacks и погашения долга."],
+        ["Total Debt / Общий долг", na, "Важно сравнивать с cash, EBITDA и денежным потоком."],
+        ["Current Ratio", na, "Показывает способность закрывать ближайшие обязательства текущими активами."],
+        ["ROE / Рентабельность капитала", na, "Показывает эффективность использования капитала акционеров."],
+        ["ROA / Рентабельность активов", na, "Показывает эффективность использования всех активов компании."],
+      ],
+    },
+    {
+      title: "5. Forward Signals / Будущие сигналы",
+      question: "Куда меняются ожидания по компании?",
+      metrics: [
+        ["Recommendation", na, "Сводная рекомендация аналитиков, если источник её предоставляет."],
+        ["Target Mean Price", na, "Средняя целевая цена аналитиков. Это ориентир ожиданий, а не гарантия."],
+        ["Earnings Growth", na, "Рост прибыли поддерживает переоценку, если ожидания подтверждаются."],
+        ["Revenue Growth", na, "Рост выручки показывает направление спроса на продукт или услугу."],
+        ["Beta", na, "Показывает чувствительность акции к рынку. Выше 1 означает более высокую волатильность."],
+        ["Dividend Yield", na, "Доходность дивидендов важна для компаний, где часть инвестиционной идеи связана с выплатами."],
+        ["Технический контекст", `Движение: ${movement}`, `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%.`],
+      ],
+    },
+  ];
+}
+
 function promtRepMessage(ticker, result) {
   const row = result.rows[0];
   if (!row) return reportErrorMessage("PromtRep", ticker, result);
@@ -469,6 +635,21 @@ async function sendTelegram(env, chatId, text, bot = {}) {
   if (!data.ok) throw new Error(data.description || "Telegram Ð½Ðµ Ð¿Ñ€Ð¸Ð½ÑÐ» ÑÐ¾Ð¾Ð±Ñ‰ÐµÐ½Ð¸Ðµ");
 }
 
+async function sendTelegramDocument(env, chatId, filename, content, caption = "", bot = {}) {
+  const token = telegramTokenForBot(env, bot);
+  if (!token) throw httpError("TELEGRAM_BOT_TOKEN is not set", 500);
+  const form = new FormData();
+  form.append("chat_id", chatId);
+  if (caption) form.append("caption", caption);
+  form.append("document", new File([content], filename, { type: "text/html; charset=utf-8" }));
+  const response = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendDocument`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await response.json();
+  if (!data.ok) throw new Error(data.description || "Telegram не принял файл");
+}
+
 function telegramTokenForBot(env, bot = {}) {
   const botId = String(bot.id || "").trim();
   const explicitSecret = String(bot.tokenSecretName || "").trim();
@@ -481,6 +662,18 @@ function telegramTokenForBot(env, bot = {}) {
     if (env[name]) return env[name];
   }
   return "";
+}
+
+function compactTimestamp(value) {
+  return String(value || new Date().toISOString()).replace(/[^0-9]/g, "").slice(0, 14);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function secretSuffix(value) {

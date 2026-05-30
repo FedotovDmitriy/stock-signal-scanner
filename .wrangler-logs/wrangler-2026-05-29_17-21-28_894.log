@@ -1,0 +1,47 @@
+
+--- 2026-05-29T17:21:29.061Z debug
+🪵  Writing logs to "C:\Users\fnemo\Desktop\Trade\stock-signal-scanner\.wrangler-logs\wrangler-2026-05-29_17-21-28_894.log"
+---
+
+--- 2026-05-29T17:21:29.061Z debug
+Metrics dispatcher: Posting data {"deviceId":"ba759bef-6300-4a8d-8383-ebdc57fd68a5","event":"wrangler command started","timestamp":1780075289061,"properties":{"amplitude_session_id":1780075289058,"amplitude_event_id":0,"wranglerVersion":"3.114.14","osPlatform":"Windows","osVersion":"Windows 11 Pro","nodeVersion":24,"packageManager":"npm","isFirstUsage":false,"configFileType":"toml","isCI":false,"isPagesCI":false,"isWorkersCI":false,"isInteractive":false,"hasAssets":false,"argsUsed":["compatibilityDate","j","name"],"argsCombination":"compatibilityDate, j, name","command":"wrangler deploy","args":{"name":"<REDACTED>","compatibilityDate":"<REDACTED>","bundle":false,"xJsonConfig":true,"j":true,"noBundle":false,"latest":false,"keepVars":false,"xAutoCreate":true,"script":"<REDACTED>"}}}
+---
+
+--- 2026-05-29T17:21:29.069Z debug
+.env file not found at ".env". Continuing... For more details, refer to https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
+---
+
+--- 2026-05-29T17:21:32.783Z log
+
+ ⛅️ wrangler 3.114.14 (update available 4.95.0)
+-----------------------------------------------
+
+---
+
+--- 2026-05-29T17:21:33.893Z warn
+▲ [WARNING] The version of Wrangler you are using is now out-of-date.
+
+  Please update to the latest version to prevent critical errors.
+  Run `npm install --save-dev wrangler@4` to update to the latest version.
+  After installation, run Wrangler with `npx wrangler`.
+
+
+---
+
+--- 2026-05-29T17:21:33.975Z log
+
+---
+
+--- 2026-05-29T17:21:33.977Z error
+X [ERROR] Build failed with 1 error:
+
+  X [ERROR] Cannot read directory "../../../..": Access is denied.
+  
+  
+
+
+---
+
+--- 2026-05-29T17:21:33.979Z debug
+Metrics dispatcher: Posting data {"deviceId":"ba759bef-6300-4a8d-8383-ebdc57fd68a5","event":"wrangler command errored","timestamp":1780075293979,"properties":{"amplitude_session_id":1780075289058,"amplitude_event_id":1,"wranglerVersion":"3.114.14","osPlatform":"Windows","osVersion":"Windows 11 Pro","nodeVersion":24,"packageManager":"npm","isFirstUsage":false,"configFileType":"toml","isCI":false,"isPagesCI":false,"isWorkersCI":false,"isInteractive":false,"hasAssets":false,"argsUsed":["compatibilityDate","j","name"],"argsCombination":"compatibilityDate, j, name","command":"wrangler deploy","args":{"name":"<REDACTED>","compatibilityDate":"<REDACTED>","bundle":false,"xJsonConfig":true,"j":true,"noBundle":false,"latest":false,"keepVars":false,"xAutoCreate":true,"script":"<REDACTED>"},"durationMs":4937,"durationSeconds":4.937,"durationMinutes":0.08228333333333333,"errorType":"BuildFailure"}}
+---
