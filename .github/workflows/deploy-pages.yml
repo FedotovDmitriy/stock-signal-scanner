@@ -1,0 +1,34 @@
+name: Deploy Pages Monitor
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare/pages/**"
+      - "wrangler.toml"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-pages-monitor
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy Cloudflare Pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy dev monitor
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy cloudflare/pages --project-name stock-signal-scanner-monitor-dev --branch main
