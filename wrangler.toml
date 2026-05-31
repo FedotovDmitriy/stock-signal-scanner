@@ -1,6 +1,7 @@
 ﻿name = "stock-signal-scanner-dev"
 main = "cloudflare/worker.js"
 compatibility_date = "2026-05-27"
+pages_build_output_dir = "cloudflare/pages"
 
 [vars]
 APP_ENV = "dev"
