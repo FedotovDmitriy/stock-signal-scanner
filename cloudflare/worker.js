@@ -44,7 +44,7 @@ export default {
       if (request.method === "POST" && ["/api/external/analyze", "/api/webhook/analyze"].includes(url.pathname)) {
         const payload = await readJson(request);
         assertWebhookToken(request, env, payload);
-        const result = await runAnalysisFromPayload(payload, env, `external ip=${clientIp(request)}`);
+        const result = await runAnalysisFromPayload(payload, env, `external ip=${clientIp(request)}`, requestCountry(request));
         return json(result);
       }
       if (request.method === "POST" && url.pathname === "/api/test-telegram") {
@@ -54,7 +54,7 @@ export default {
         const chatId = String(payload.telegramChatId || payload.chatId || env.TELEGRAM_CHAT_ID || "").trim();
         if (!chatId) throw httpError("telegramChatId is required for test message", 400);
         await sendTelegram(env, chatId, `Stock Signal Scanner test\nEnvironment: ${env.APP_ENV || "dev"}\nTime: ${new Date().toISOString()}`, normalized.bot);
-        await addLog(env, `ui ip=${clientIp(request)}`, "Telegram test", "-", "ok", `bot=${normalized.bot.id || "-"}`);
+        await addLog(env, `ui ip=${clientIp(request)}`, "Telegram test", "-", "ok", `bot=${normalized.bot.id || "-"}`, requestCountry(request));
         return json({ ok: true, message: "Test Telegram message sent" });
       }
       if (request.method === "POST" && url.pathname === "/api/clear-logs") {
@@ -76,7 +76,7 @@ export default {
   },
 };
 
-async function runAnalysisFromPayload(payload, env, origin) {
+async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel = "-") {
   const normalized = normalizeExternalPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
   if (!tickers.length) throw httpError("ÐŸÐµÑ€ÐµÐ´Ð°Ð¹Ñ‚Ðµ ticker Ð¸Ð»Ð¸ tickers", 400);
@@ -85,7 +85,8 @@ async function runAnalysisFromPayload(payload, env, origin) {
   const requestKey = normalized.requestId || news?.id || crypto.randomUUID();
   const newsId = news?.id || (news ? requestKey : null);
 
-  await addLog(env, origin, "External analysis", tickers.join(", "), "started", `timeframe=${timeframe}; request=${requestKey}`);
+  const logCountry = requestCountryLabel && requestCountryLabel !== "-" ? requestCountryLabel : payloadCountryLabel(country);
+  await addLog(env, origin, "External analysis", tickers.join(", "), "started", `timeframe=${timeframe}; request=${requestKey}`, logCountry);
   if (env.DB) await storeMatcherPayload(env, normalized, newsId);
   const result = await analyzeTickers(tickers, { timeframe, strategies, risk, anchorBars });
   result.origin = origin;
@@ -108,7 +109,8 @@ async function runAnalysisFromPayload(payload, env, origin) {
     "External analysis",
     tickers.join(", "),
     result.errors.length ? "partial" : "ok",
-    `errors=${result.errors.length}; signals=${countSignals(result.rows)}`
+    `errors=${result.errors.length}; signals=${countSignals(result.rows)}`,
+    logCountry
   );
   return result;
 }
@@ -119,11 +121,12 @@ async function handleTelegramUpdate(update, env, request) {
   const chatId = String(chat.id || "");
   const text = String(message.text || "").trim();
   const origin = telegramOrigin(message, request);
+  const country = telegramCountry(message, request);
   if (!chatId || !text) return;
 
   const reportCommand = parseTelegramReportCommand(text);
   if (reportCommand) {
-    await handleTelegramReportCommand(reportCommand, env, chatId, origin);
+    await handleTelegramReportCommand(reportCommand, env, chatId, origin, country);
     return;
   }
 
@@ -133,7 +136,7 @@ async function handleTelegramUpdate(update, env, request) {
     return;
   }
 
-  await addLog(env, origin, "Telegram analysis", tickers.join(", "), "started", "");
+  await addLog(env, origin, "Telegram analysis", tickers.join(", "), "started", "", country);
   const result = await analyzeTickers(tickers, {
     timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
     strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
@@ -141,20 +144,20 @@ async function handleTelegramUpdate(update, env, request) {
     anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
   });
   await sendTelegram(env, chatId, analysisReportMessage(result));
-  await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`);
+  await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`, country);
 }
 
-async function handleTelegramReportCommand(command, env, chatId, origin) {
+async function handleTelegramReportCommand(command, env, chatId, origin, country = "-") {
   if (!command.tickers.length) {
     await sendTelegram(env, chatId, `Напишите команду с тикером, например: ${command.label} AAPL`);
     return;
   }
 
-  await addLog(env, origin, command.label, command.tickers.join(", "), "started", "");
+  await addLog(env, origin, command.label, command.tickers.join(", "), "started", "", country);
   for (const ticker of command.tickers) {
     if (!isValidTicker(ticker)) {
       await sendTelegram(env, chatId, `${ticker}: ${tickerValidationError(ticker)}`);
-      await addLog(env, origin, command.label, ticker, "error", tickerValidationError(ticker));
+      await addLog(env, origin, command.label, ticker, "error", tickerValidationError(ticker), country);
       continue;
     }
 
@@ -170,7 +173,7 @@ async function handleTelegramReportCommand(command, env, chatId, origin) {
     } else {
       await sendTelegram(env, chatId, promtRepMessage(ticker, result));
     }
-    await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`);
+    await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`, country);
   }
 }
 
@@ -825,19 +828,30 @@ async function storeMatcherPayload(env, normalized, newsId) {
   }
 }
 
-async function addLog(env, origin, action, tickers, status, detail = "") {
+async function addLog(env, origin, action, tickers, status, detail = "", country = "-") {
   if (!env.DB) return;
+  await ensureRequestLogCountryColumn(env);
   await env.DB.prepare(
-    "INSERT INTO request_logs (time, origin, action, tickers, status, detail) VALUES (?, ?, ?, ?, ?, ?)"
-  ).bind(new Date().toISOString(), origin, action, tickers, status, detail).run();
+    "INSERT INTO request_logs (time, origin, action, tickers, status, country, detail) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(new Date().toISOString(), origin, action, tickers, status, country || "-", detail).run();
 }
 
 async function latestLogs(env) {
   if (!env.DB) return [];
+  await ensureRequestLogCountryColumn(env);
   const result = await env.DB.prepare(
-    "SELECT time, origin, action, tickers, status, detail FROM request_logs ORDER BY id DESC LIMIT 80"
+    "SELECT time, origin, action, tickers, status, country, detail FROM request_logs ORDER BY id DESC LIMIT 80"
   ).all();
   return result.results || [];
+}
+
+async function ensureRequestLogCountryColumn(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare("ALTER TABLE request_logs ADD COLUMN country TEXT NOT NULL DEFAULT '-'").run();
+  } catch (error) {
+    if (!String(error?.message || error).toLowerCase().includes("duplicate column")) throw error;
+  }
 }
 
 async function latestStats(env) {
@@ -994,6 +1008,20 @@ function telegramOrigin(message, request) {
 
 function clientIp(request) {
   return request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "-";
+}
+
+function requestCountry(request) {
+  return request.cf?.country || request.headers.get("CF-IPCountry") || "-";
+}
+
+function telegramCountry(message, request) {
+  const language = String(message.from?.language_code || "").trim();
+  if (language) return `lang:${language}`;
+  return requestCountry(request);
+}
+
+function payloadCountryLabel(country = {}) {
+  return country.iso2 || country.name || country.id || "-";
 }
 
 function countSignals(rows) {

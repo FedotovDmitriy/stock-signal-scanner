@@ -159,6 +159,15 @@
     .short { color: var(--red); font-weight: 760; }
     .none { color: var(--muted); }
     .logs { display: grid; gap: 8px; padding: 14px 16px 16px; }
+    .chart-wrap { padding: 14px 16px 16px; }
+    .chart {
+      width: 100%;
+      height: 220px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0d1114;
+    }
+    .chart-hint { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
     .log-row {
       display: grid;
       grid-template-columns: 148px 1fr;
@@ -280,14 +289,26 @@
                   <th>Время</th>
                   <th>Действие</th>
                   <th>Тикеры</th>
+                  <th>Страна</th>
                   <th>Статус</th>
                   <th>Детали</th>
                 </tr>
               </thead>
-              <tbody id="rows"><tr><td colspan="5" class="empty">Пока нет завершённых запросов</td></tr></tbody>
+              <tbody id="rows"><tr><td colspan="6" class="empty">Пока нет завершённых запросов</td></tr></tbody>
             </table>
           </div>
           <div class="toast" id="toast"></div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <strong>График запросов</strong>
+            <span class="pill" id="chartSummary">0 запросов</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas class="chart" id="requestChart" width="900" height="260"></canvas>
+            <p class="chart-hint">Столбцы показывают количество запросов по времени на основе логов Worker.</p>
+          </div>
         </div>
 
         <div class="panel">
@@ -394,6 +415,7 @@
       $("environment").textContent = `${currentEnv().label || activeEnv} · ${state.environment || "-"}`;
       $("updatedAt").textContent = state.time || "-";
       renderResultLogs(state.logs || []);
+      renderRequestChart(state.logs || []);
       renderLogs(state.logs || []);
     }
     function renderResultLogs(logs) {
@@ -404,10 +426,71 @@
           <td>${esc(log.time || "-")}</td>
           <td>${esc(log.action || "-")}</td>
           <td class="ticker">${esc(log.tickers || "-")}</td>
+          <td>${esc(log.country || "-")}</td>
           <td><span class="${log.status === "ok" ? "long" : log.status === "error" ? "short" : "none"}">${esc(log.status || "-")}</span></td>
           <td>${esc(log.detail || "-")}</td>
         </tr>
-      `).join("") : `<tr><td colspan="5" class="empty">Пока нет завершённых запросов</td></tr>`;
+      `).join("") : `<tr><td colspan="6" class="empty">Пока нет завершённых запросов</td></tr>`;
+    }
+    function renderRequestChart(logs) {
+      const canvas = $("requestChart");
+      const summary = $("chartSummary");
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const width = canvas.width;
+      const height = canvas.height;
+      const padding = { top: 24, right: 20, bottom: 42, left: 46 };
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#0d1114";
+      ctx.fillRect(0, 0, width, height);
+      const buckets = new Map();
+      for (const log of logs) {
+        const date = new Date(log.time || "");
+        if (Number.isNaN(date.getTime())) continue;
+        date.setMinutes(0, 0, 0);
+        const key = date.toISOString();
+        buckets.set(key, (buckets.get(key) || 0) + 1);
+      }
+      const points = [...buckets.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .slice(-12)
+        .map(([time, count]) => ({ time, count }));
+      const total = points.reduce((sum, point) => sum + point.count, 0);
+      summary.textContent = total ? `${total} запросов` : "0 запросов";
+      ctx.strokeStyle = "#24313d";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padding.left, padding.top);
+      ctx.lineTo(padding.left, height - padding.bottom);
+      ctx.lineTo(width - padding.right, height - padding.bottom);
+      ctx.stroke();
+      if (!points.length) {
+        ctx.fillStyle = "#8fa0af";
+        ctx.font = "14px system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText("Пока нет данных для графика", width / 2, height / 2);
+        return;
+      }
+      const plotWidth = width - padding.left - padding.right;
+      const plotHeight = height - padding.top - padding.bottom;
+      const max = Math.max(...points.map((point) => point.count), 1);
+      const barGap = 8;
+      const barWidth = Math.max(10, (plotWidth - barGap * (points.length - 1)) / points.length);
+      ctx.fillStyle = "#26c485";
+      points.forEach((point, index) => {
+        const x = padding.left + index * (barWidth + barGap);
+        const barHeight = Math.max(4, (point.count / max) * plotHeight);
+        const y = height - padding.bottom - barHeight;
+        ctx.fillRect(x, y, barWidth, barHeight);
+        ctx.fillStyle = "#dce5ec";
+        ctx.font = "12px system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText(String(point.count), x + barWidth / 2, y - 6);
+        ctx.fillStyle = "#8fa0af";
+        const label = new Date(point.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        ctx.fillText(label, x + barWidth / 2, height - 16);
+        ctx.fillStyle = "#26c485";
+      });
     }
     function renderLogs(logs) {
       $("logCount").textContent = `${logs.length} записей`;
@@ -417,7 +500,8 @@
           <div>
             <strong>${esc(log.action || "-")} · ${esc(log.status || "-")}</strong><br>
             <span>Откуда: ${esc(log.origin || "-")}</span><br>
-            <span>Тикеры: ${esc(log.tickers || "-")}</span>
+            <span>Тикеры: ${esc(log.tickers || "-")}</span><br>
+            <span>Страна: ${esc(log.country || "-")}</span>
             ${log.detail ? `<br><span>Детали: ${esc(log.detail)}</span>` : ""}
           </div>
         </div>

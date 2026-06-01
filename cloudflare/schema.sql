@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
   action TEXT NOT NULL,
   tickers TEXT NOT NULL,
   status TEXT NOT NULL,
+  country TEXT NOT NULL DEFAULT '-',
   detail TEXT NOT NULL DEFAULT ''
 );
 
