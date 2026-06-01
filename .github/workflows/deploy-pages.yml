@@ -18,6 +18,8 @@ jobs:
   deploy:
     name: Deploy Cloudflare Pages
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: read
       deployments: write
@@ -31,4 +33,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy cloudflare/pages --project-name stock-signal-scanner-monitor-dev --branch main
+          command: pages deploy cloudflare/pages --project-name stock-signal-scanner-monitor-dev --branch dev
