@@ -84,6 +84,12 @@
     }
     textarea { min-height: 86px; resize: vertical; }
     input:focus, textarea:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(125, 211, 252, .12); }
+    .metric select {
+      margin-top: 6px;
+      min-height: 34px;
+      padding: 7px 9px;
+      font-weight: 760;
+    }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .env-bar {
       display: grid;
@@ -199,7 +205,11 @@
       </div>
       <div class="metrics">
         <div class="metric"><span>Worker</span><strong id="workerState">-</strong></div>
-        <div class="metric"><span>Среда</span><strong id="environment">-</strong></div>
+        <div class="metric">
+          <span>Среда</span>
+          <select id="headerActiveEnv"></select>
+          <strong id="environment">-</strong>
+        </div>
         <div class="metric"><span>Последнее обновление</span><strong id="updatedAt">-</strong></div>
       </div>
     </header>
@@ -332,7 +342,7 @@
       },
       prod: {
         label: "Prod",
-        apiBase: "",
+        apiBase: "https://stock-signal-scanner-production.fnemoy.workers.dev",
         apiToken: "",
       },
       custom: {
@@ -345,8 +355,15 @@
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     }[char]));
     const saved = JSON.parse(localStorage.getItem("scannerMonitor") || "{}");
-    const environments = { ...DEFAULT_ENVS, ...(saved.environments || {}) };
-    let activeEnv = saved.activeEnv || "dev";
+    const environments = Object.fromEntries(Object.entries(DEFAULT_ENVS).map(([key, env]) => [
+      key,
+      { ...env, ...((saved.environments || {})[key] || {}) },
+    ]));
+    for (const [key, env] of Object.entries(saved.environments || {})) {
+      environments[key] = { ...(DEFAULT_ENVS[key] || {}), ...env };
+    }
+    if (!environments.prod.apiBase) environments.prod.apiBase = DEFAULT_ENVS.prod.apiBase;
+    let activeEnv = environments[saved.activeEnv] ? saved.activeEnv : "dev";
     ["telegramChatId", "botId"].forEach((id) => {
       if (saved[id]) $(id).value = saved[id];
     });
@@ -358,8 +375,10 @@
       return environments[activeEnv] || environments.dev;
     }
     function renderEnvControls() {
+      $("headerActiveEnv").innerHTML = envOptions();
       $("activeEnv").innerHTML = envOptions();
       $("settingsEnv").innerHTML = envOptions();
+      $("headerActiveEnv").value = activeEnv;
       $("activeEnv").value = activeEnv;
       $("settingsEnv").value = activeEnv;
       renderEnvSettings();
@@ -387,7 +406,7 @@
     }
     async function api(path, options = {}) {
       saveLocal();
-      const headers = { ...(options.headers || {}) };
+      const headers = { "Cache-Control": "no-store", ...(options.headers || {}) };
       if (currentEnv().apiToken) headers["X-Scanner-Token"] = currentEnv().apiToken;
       const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
       const data = await response.json();
@@ -443,18 +462,20 @@
       ctx.clearRect(0, 0, width, height);
       ctx.fillStyle = "#0d1114";
       ctx.fillRect(0, 0, width, height);
-      const buckets = new Map();
+      const intervalMs = 5 * 60 * 1000;
+      const end = Math.floor(Date.now() / intervalMs) * intervalMs;
+      const points = Array.from({ length: 12 }, (_, index) => {
+        const time = end - (11 - index) * intervalMs;
+        return { time, count: 0 };
+      });
+      const buckets = new Map(points.map((point) => [point.time, point]));
       for (const log of logs) {
         const date = new Date(log.time || "");
         if (Number.isNaN(date.getTime())) continue;
-        date.setMinutes(0, 0, 0);
-        const key = date.toISOString();
-        buckets.set(key, (buckets.get(key) || 0) + 1);
+        const key = Math.floor(date.getTime() / intervalMs) * intervalMs;
+        const bucket = buckets.get(key);
+        if (bucket) bucket.count += 1;
       }
-      const points = [...buckets.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .slice(-12)
-        .map(([time, count]) => ({ time, count }));
       const total = points.reduce((sum, point) => sum + point.count, 0);
       summary.textContent = total ? `${total} запросов` : "0 запросов";
       ctx.strokeStyle = "#24313d";
@@ -508,19 +529,23 @@
       `).join("") : `<div class="empty">Пока запросов нет</div>`;
     }
     async function refresh() {
-      const state = await api("/api/status");
+      const state = await api(`/api/status?ts=${Date.now()}`);
       renderStatus(state);
     }
-    $("settingsBtn").addEventListener("click", () => {
-      $("settingsPanel").classList.toggle("open");
-    });
-    $("activeEnv").addEventListener("change", async () => {
-      activeEnv = $("activeEnv").value;
+    async function changeActiveEnv(value) {
+      activeEnv = value;
+      $("headerActiveEnv").value = activeEnv;
+      $("activeEnv").value = activeEnv;
       $("settingsEnv").value = activeEnv;
       renderEnvSettings();
       saveLocal();
       try { await refresh(); } catch (error) { $("toast").textContent = error.message; }
+    }
+    $("settingsBtn").addEventListener("click", () => {
+      $("settingsPanel").classList.toggle("open");
     });
+    $("headerActiveEnv").addEventListener("change", () => changeActiveEnv($("headerActiveEnv").value));
+    $("activeEnv").addEventListener("change", () => changeActiveEnv($("activeEnv").value));
     $("settingsEnv").addEventListener("change", renderEnvSettings);
     $("saveEnvBtn").addEventListener("click", async () => {
       const key = $("settingsEnv").value || activeEnv;
