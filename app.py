@@ -455,6 +455,7 @@ def count_available_metrics(data: dict[str, Any]) -> int:
         ("financialData", "earningsGrowth"),
         ("summaryDetail", "trailingPE"),
         ("summaryDetail", "forwardPE"),
+        ("defaultKeyStatistics", "capeRatio"),
         ("summaryDetail", "priceToSalesTrailing12Months"),
         ("summaryDetail", "beta"),
         ("summaryDetail", "dividendYield"),
@@ -593,6 +594,14 @@ def fetch_fmp_fundamental_data(ticker: str, api_key: str) -> dict[str, Any]:
             "trailingEps": pick(quote.get("eps"), key_metrics.get("netIncomePerShareTTM")),
             "enterpriseToEbitda": key_metrics.get("enterpriseValueOverEBITDATTM"),
             "pegRatio": key_metrics.get("pegRatioTTM"),
+            "capeRatio": pick(
+                key_metrics.get("capeRatioTTM"),
+                key_metrics.get("capeRatio"),
+                key_metrics.get("shillerPERatio"),
+                ratios.get("capeRatioTTM"),
+                ratios.get("capeRatio"),
+                ratios.get("shillerPERatio"),
+            ),
             "priceToBook": key_metrics.get("pbRatioTTM"),
         },
     }
@@ -660,6 +669,18 @@ def build_standard_fundamental_data(
             "trailingEps": pick(profile.get("EPS"), quote.get("eps"), metrics.get("eps")),
             "enterpriseToEbitda": pick(metrics.get("enterpriseToEbitda"), ratios.get("enterpriseValueOverEBITDA")),
             "pegRatio": pick(profile.get("PEGRatio"), metrics.get("pegRatio")),
+            "capeRatio": pick(
+                profile.get("CAPE"),
+                profile.get("CapeRatio"),
+                profile.get("ShillerPE"),
+                profile.get("ShillerPERatio"),
+                metrics.get("capeRatio"),
+                metrics.get("capeRatioTTM"),
+                metrics.get("shillerPERatio"),
+                ratios.get("capeRatio"),
+                ratios.get("capeRatioTTM"),
+                ratios.get("shillerPERatio"),
+            ),
             "priceToBook": pick(profile.get("PriceToBookRatio"), metrics.get("priceToBookRatio")),
         },
     }
@@ -1302,6 +1323,7 @@ def build_fundrep_sections(ticker: str, data: dict[str, Any]) -> list[dict[str, 
                 ("Market Cap / Капитализация", fmt_money(metric_value(data, "price", "marketCap")), "Размер компании на рынке. Важно сравнивать с выручкой, прибылью и денежным потоком."),
                 ("P/E / Цена к прибыли", fmt_metric(metric_value(data, "summaryDetail", "trailingPE")), "Показывает, сколько инвестор платит за доллар текущей прибыли."),
                 ("Forward P/E / Будущий P/E", fmt_metric(metric_value(data, "summaryDetail", "forwardPE")), "Использует ожидаемую прибыль и полезен для растущих компаний, но зависит от прогнозов."),
+                ("CAPE / Cyclically Adjusted P/E", fmt_metric(metric_value(data, "defaultKeyStatistics", "capeRatio")), "CAPE сравнивает цену с усреднённой инфляционно сглаженной прибылью за длинный цикл. Он помогает понять, не завышена ли оценка относительно нормализованной прибыли, но для отдельных компаний часто доступен хуже, чем для индексов."),
                 ("P/S / Цена к выручке", fmt_metric(metric_value(data, "summaryDetail", "priceToSalesTrailing12Months")), "Особенно полезен для компаний, где прибыль пока нестабильна."),
                 ("EV / EBITDA", fmt_metric(metric_value(data, "defaultKeyStatistics", "enterpriseToEbitda")), "Сравнивает стоимость предприятия с EBITDA и учитывает долг."),
                 ("PEG Ratio", fmt_metric(metric_value(data, "defaultKeyStatistics", "pegRatio")), "Сравнивает P/E с темпом роста прибыли. Ниже 1 часто выглядит интереснее, но не является автоматическим сигналом."),
@@ -1597,6 +1619,20 @@ Compare to the sector median forward P/E and to two direct competitors.
 **INTERPRET**
 
 Is the multiple expanding or compressing, and is that driven by price movement or earnings estimate changes?
+
+### CAPE / Cyclically Adjusted P/E
+
+**DATA**
+
+Pull {ticker}'s CAPE ratio where available. If company-level CAPE is unavailable, calculate or approximate it from price divided by long-cycle average inflation-adjusted EPS, and clearly label the method and limitations.
+
+**COMPARE**
+
+Compare CAPE to the company's own long-term valuation history, the sector median where available, and the broad market CAPE as context.
+
+**INTERPRET**
+
+Explain whether valuation looks stretched or reasonable versus normalized earnings. Note that CAPE is more robust for indexes than single companies, so use it as a long-cycle valuation lens rather than a standalone signal.
 
 ### Price-to-Sales / P/S
 
