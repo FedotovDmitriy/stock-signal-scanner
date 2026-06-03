@@ -25,7 +25,7 @@ export default {
         return json({
           ok: true,
           service: "stock-signal-scanner-cloudflare",
-          endpoints: ["/api/status", "/api/external/analyze", "/api/webhook/analyze", "/api/test-telegram", "/api/clear-logs", "/telegram/webhook"],
+          endpoints: ["/api/status", "/scan", "/api/external/analyze", "/api/webhook/analyze", "/api/test-telegram", "/api/clear-logs", "/telegram/webhook"],
         });
       }
       if (request.method === "GET" && url.pathname === "/api/status") {
@@ -41,7 +41,7 @@ export default {
           stats,
         });
       }
-      if (request.method === "POST" && ["/api/external/analyze", "/api/webhook/analyze"].includes(url.pathname)) {
+      if (request.method === "POST" && ["/scan", "/api/external/analyze", "/api/webhook/analyze"].includes(url.pathname)) {
         const payload = await readJson(request);
         assertWebhookToken(request, env, payload);
         const result = await runAnalysisFromPayload(payload, env, `external ip=${clientIp(request)}`, requestCountry(request));

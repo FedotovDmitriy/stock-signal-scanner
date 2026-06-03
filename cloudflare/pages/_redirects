@@ -1,0 +1,2 @@
+/scan https://stock-signal-scanner-dev.fnemoy.workers.dev/api/external/analyze 307
+/scan/* https://stock-signal-scanner-dev.fnemoy.workers.dev/api/external/analyze 307
