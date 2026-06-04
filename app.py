@@ -878,6 +878,13 @@ def fmt_percent(value: Any) -> str:
     return f"{float(value) * 100:.2f}%"
 
 
+def format_distance(value: Any) -> str:
+    if value in (None, "", {}):
+        return "-"
+    number = float(value)
+    return f"{'+' if number > 0 else ''}{number:.2f}%"
+
+
 def fmt_money(value: Any) -> str:
     if value in (None, "", {}):
         return "н/д"
@@ -905,6 +912,13 @@ def ema(values: list[float], period: int) -> list[float | None]:
         previous = (values[idx] - previous) * multiplier + previous
         result[idx] = previous
     return result
+
+
+def moving_average(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    selected = values[-period:]
+    return sum(selected) / period
 
 
 def atr(candles: list[Candle], period: int = 14) -> float:
@@ -1000,6 +1014,7 @@ def analyze_ticker(ticker: str, timeframe: str, strategies: list[str], risk: flo
     closes = [candle.close for candle in candles]
     price = closes[-1]
     ema200 = ema(closes, 200)[-1]
+    mma150 = moving_average(closes, 150)
     avwap_value = avwap(candles, anchor_bars)
     atr_value = atr(candles)
     poc = volume_poc(candles)
@@ -1126,7 +1141,10 @@ def analyze_ticker(ticker: str, timeframe: str, strategies: list[str], risk: flo
         "change_percent": round(((price / previous.close) - 1) * 100, 2) if previous.close else 0,
         "direction": "up" if price > previous.close else "down" if price < previous.close else "flat",
         "ema200": round(ema200, 2) if ema200 else None,
+        "mma150": round(mma150, 2) if mma150 else None,
+        "mma150_distance_percent": round(((price / mma150) - 1) * 100, 2) if mma150 else None,
         "avwap": round(avwap_value, 2),
+        "atr14": round(atr_value, 2),
         "poc": round(poc, 2),
         "rsi14": round(rsi14, 1),
         "roc20": round(roc20, 2),
@@ -1183,6 +1201,7 @@ def analysis_report_message(result: dict[str, Any]) -> str:
                 f"Цена: {row['price']:.2f}",
                 f"Движение: {movement}",
                 f"EMA200: {row.get('ema200', '-')}, AVWAP: {row.get('avwap', '-')}, RSI: {row.get('rsi14', '-')}",
+                f"ATR14: {row.get('atr14', '-')}, MMA150: {row.get('mma150', '-')}, от MMA150: {format_distance(row.get('mma150_distance_percent'))}",
             ]
         )
         if signals:
@@ -2794,13 +2813,15 @@ HTML = r"""<!doctype html>
                   <th>Цена</th>
                   <th>EMA200</th>
                   <th>AVWAP</th>
+                  <th>ATR14</th>
+                  <th>MMA150</th>
                   <th>POC</th>
                   <th>RSI</th>
                   <th>Momentum</th>
                   <th>Сигнал</th>
                 </tr>
               </thead>
-              <tbody id="rows"><tr><td colspan="8" class="empty">Запустите анализ</td></tr></tbody>
+              <tbody id="rows"><tr><td colspan="10" class="empty">Запустите анализ</td></tr></tbody>
             </table>
           </div>
           <div class="toast" id="toast"></div>
@@ -2828,6 +2849,12 @@ HTML = r"""<!doctype html>
       '"': "&quot;",
       "'": "&#039;"
     }[char]));
+    const formatSignedPercent = (value) => {
+      if (value === null || value === undefined || value === "") return "-";
+      const number = Number(value);
+      if (Number.isNaN(number)) return "-";
+      return `${number > 0 ? "+" : ""}${number.toFixed(2)}%`;
+    };
 
     function config() {
       return {
@@ -2928,12 +2955,14 @@ HTML = r"""<!doctype html>
           <td>${directionIcon} ${esc(row.price ?? "-")}<br><span class="none">${esc(changeText)}</span></td>
           <td>${esc(row.ema200 ?? "-")}</td>
           <td>${esc(row.avwap ?? "-")}</td>
+          <td>${esc(row.atr14 ?? "-")}</td>
+          <td>${esc(row.mma150 ?? "-")}<br><span class="none">${esc(formatSignedPercent(row.mma150_distance_percent))}</span></td>
           <td>${esc(row.poc ?? "-")}</td>
           <td>${esc(row.rsi14 ?? "-")}</td>
           <td>${esc(row.roc20 ?? "-")}%<br><span class="none">${esc(row.last_checked || "")}</span></td>
           <td>${signalText}</td>
         </tr>`;
-      }).join("") : `<tr><td colspan="8" class="empty">Нет данных</td></tr>`;
+      }).join("") : `<tr><td colspan="10" class="empty">Нет данных</td></tr>`;
 
       const errors = result.errors || [];
       $("toast").textContent = errors.length ? errors.map(e => `${e.ticker}: ${e.error}`).join(" · ") : "";

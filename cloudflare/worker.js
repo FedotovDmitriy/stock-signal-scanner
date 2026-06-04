@@ -235,6 +235,7 @@ function analyzeTicker(ticker, candles, config) {
   const closes = candles.map((candle) => candle.close);
   const price = latest.close;
   const ema200 = ema(closes, 200);
+  const mma150 = movingAverage(closes, 150);
   const avwap = anchoredVwap(candles, config.anchorBars);
   const poc = volumePoc(candles.slice(-Math.min(candles.length, 120)));
   const rsi = rsi14(closes);
@@ -277,7 +278,10 @@ function analyzeTicker(ticker, candles, config) {
     change_percent: previous.close ? round(((price / previous.close) - 1) * 100, 2) : 0,
     direction: price > previous.close ? "up" : price < previous.close ? "down" : "flat",
     ema200: ema200 ? round(ema200, 2) : null,
+    mma150: mma150 ? round(mma150, 2) : null,
+    mma150_distance_percent: mma150 ? round(((price / mma150) - 1) * 100, 2) : null,
     avwap: round(avwap, 2),
+    atr14: round(atr, 2),
     poc: round(poc, 2),
     rsi14: round(rsi, 1),
     roc20: round(roc20, 2),
@@ -308,12 +312,13 @@ function analysisReportMessage(result) {
   ];
 
   for (const row of result.rows) {
-    const arrow = row.direction === "up" ? "🟩⬆️" : row.direction === "down" ? "🟥⬇️" : "⬜➡️";
+    const arrow = row.direction === "up" ? "🟢⬆️" : row.direction === "down" ? "🔴⬇️" : "⚪➡️";
     const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
     lines.push(`${arrow} ${row.ticker}`);
     lines.push(`Цена: ${row.price.toFixed(2)}`);
     lines.push(`Движение: ${movement}`);
     lines.push(`EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}`);
+    lines.push(`ATR14: ${valueOrDash(row.atr14)}, MMA150: ${valueOrDash(row.mma150)}, от MMA150: ${distanceText(row.mma150_distance_percent)}`);
     if (row.signals.length) {
       lines.push("");
       lines.push("✅ Сигналы:");
@@ -885,6 +890,12 @@ function ema(values, period) {
   return current;
 }
 
+function movingAverage(values, period) {
+  if (values.length < period) return null;
+  const selected = values.slice(-period);
+  return selected.reduce((sum, value) => sum + value, 0) / period;
+}
+
 function anchoredVwap(candles, bars) {
   const selected = candles.slice(-Math.min(candles.length, bars));
   let pv = 0;
@@ -1034,6 +1045,11 @@ function countSignals(rows) {
 
 function valueOrDash(value) {
   return value == null || Number.isNaN(value) ? "-" : value;
+}
+
+function distanceText(value) {
+  if (value == null || Number.isNaN(value)) return "-";
+  return `${value > 0 ? "+" : ""}${round(value, 2)}%`;
 }
 
 function round(value, digits) {
