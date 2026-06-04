@@ -1,0 +1,68 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare/worker.js"
+      - "cloudflare/schema.sql"
+      - "wrangler.toml"
+      - "wrangler.worker.toml"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Worker environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - production
+
+concurrency:
+  group: deploy-worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy Cloudflare Worker
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      TARGET_ENV: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check Worker syntax
+        run: node --check cloudflare/worker.js
+
+      - name: Deploy dev Worker
+        if: env.TARGET_ENV == 'dev'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            d1 execute stock_signal_scanner_dev --remote --file=cloudflare/schema.sql
+            deploy --config wrangler.worker.toml --env=""
+
+      - name: Deploy production Worker
+        if: env.TARGET_ENV == 'production'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            d1 execute stock_signal_scanner_production --remote --file=cloudflare/schema.sql
+            deploy --config wrangler.worker.toml --env production

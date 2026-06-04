@@ -4,8 +4,8 @@
   "type": "module",
   "scripts": {
     "cf:dev": "wrangler dev",
-    "cf:deploy:dev": "wrangler deploy --env=\"\"",
-    "cf:deploy:production": "wrangler deploy --env production",
+    "cf:deploy:dev": "wrangler deploy --config wrangler.worker.toml --env=\"\"",
+    "cf:deploy:production": "wrangler deploy --config wrangler.worker.toml --env production",
     "cf:pages:dev": "wrangler pages dev cloudflare/pages",
     "cf:pages:deploy:dev": "wrangler pages deploy cloudflare/pages --project-name stock-signal-scanner-monitor-dev",
     "cf:pages:deploy:production": "wrangler pages deploy cloudflare/pages --project-name stock-signal-scanner-monitor",

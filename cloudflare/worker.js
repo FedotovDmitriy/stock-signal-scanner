@@ -168,7 +168,8 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
       anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
     });
     if (command.type === "fundrep") {
-      const html = fundRepHtml(ticker, result);
+      const fundamentals = await fetchFundamentalData(ticker);
+      const html = fundRepHtml(ticker, result, fundamentals);
       await sendTelegramDocument(env, chatId, `fundrep_${ticker}_${compactTimestamp(result.timestamp)}.html`, html, `FundRep ${ticker}: фундаментальный отчёт.`);
     } else {
       await sendTelegram(env, chatId, promtRepMessage(ticker, result));
@@ -420,13 +421,75 @@ function fundRepMessage(ticker, result) {
   return lines.join("\n").trim();
 }
 
-function fundRepHtml(ticker, result) {
+async function fetchFundamentalData(ticker) {
+  const safeTicker = encodeURIComponent(ticker);
+  const modules = "price,summaryDetail,defaultKeyStatistics,financialData,assetProfile";
+  try {
+    const response = await fetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${safeTicker}?modules=${modules}`, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!response.ok) throw new Error(`quoteSummary HTTP ${response.status}`);
+    const data = await response.json();
+    const result = data?.quoteSummary?.result?.[0];
+    if (result) {
+      return {
+        ...result,
+        fundrepDataStatus: "Фундаментальные данные Yahoo Finance получены.",
+      };
+    }
+    throw new Error("quoteSummary empty");
+  } catch (error) {
+    try {
+      const response = await fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${safeTicker}`, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (!response.ok) throw new Error(`quote HTTP ${response.status}`);
+      const data = await response.json();
+      const quote = data?.quoteResponse?.result?.[0] || {};
+      return {
+        fundrepDataStatus: `quoteSummary недоступен: ${error.message || error}. Использованы доступные quote-данные.`,
+        price: {
+          shortName: quote.shortName || quote.longName || ticker,
+          regularMarketPrice: quote.regularMarketPrice,
+          currency: quote.currency,
+          marketCap: quote.marketCap,
+        },
+        assetProfile: {
+          sector: quote.sector,
+          industry: quote.industry,
+        },
+        financialData: {
+          revenueGrowth: quote.revenueGrowth,
+          earningsGrowth: quote.earningsGrowth,
+          targetMeanPrice: quote.targetMeanPrice,
+        },
+        summaryDetail: {
+          trailingPE: quote.trailingPE,
+          forwardPE: quote.forwardPE,
+          priceToSalesTrailing12Months: quote.priceToSalesTrailing12Months,
+          beta: quote.beta,
+          dividendYield: quote.dividendYield,
+        },
+        defaultKeyStatistics: {
+          trailingEps: quote.epsTrailingTwelveMonths,
+          priceToBook: quote.priceToBook,
+        },
+      };
+    } catch (fallbackError) {
+      return {
+        fundrepDataStatus: `Фундаментальные данные недоступны: ${fallbackError.message || fallbackError}.`,
+      };
+    }
+  }
+}
+
+function fundRepHtml(ticker, result, fundamentals = {}) {
   const row = result.rows[0];
   if (!row) {
     return `<!doctype html><meta charset="utf-8"><title>FundRep ${escapeHtml(ticker)}</title><body><pre>${escapeHtml(reportErrorMessage("FundRep", ticker, result))}</pre></body>`;
   }
 
-  const sections = fundRepSections(ticker, row);
+  const sections = fundRepSections(ticker, row, fundamentals);
   const sectionHtml = sections.map((section) => `
     <section>
       <h2>${escapeHtml(section.title)}</h2>
@@ -511,79 +574,86 @@ function fundRepHtml(ticker, result) {
 </head>
 <body>
   <h1>FundRep: фундаментальный отчёт по ${escapeHtml(ticker)}</h1>
-  <p class="meta">Дата: ${escapeHtml(result.timestamp)} · Не является инвестиционной рекомендацией.</p>
+  <p class="meta">Дата: ${escapeHtml(result.timestamp)} · ${escapeHtml(fundamentals.fundrepDataStatus || "Фундаментальные данные частично доступны.")} · Не является инвестиционной рекомендацией.</p>
   ${sectionHtml}
   <div class="note">Короткая шпаргалка: Profitability отвечает на вопрос о качестве прибыли; Valuation — о цене; Cash Flow — о реальных деньгах; Financial Health — о прочности баланса; Forward Signals — об ожиданиях рынка.</div>
 </body>
 </html>`;
 }
 
-function fundRepSections(ticker, row) {
+function fundRepSections(ticker, row, data = {}) {
   const na = "н/д";
-  const price = `${row.price.toFixed(2)} USD`;
+  const priceValue = metricValue(data, "price", "regularMarketPrice") ?? row.price;
+  const currency = fmtMetric(metricValue(data, "price", "currency") || "USD");
+  const price = `${fmtMetric(priceValue)} ${currency}`;
   const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
+  const marketCap = metricValue(data, "price", "marketCap");
+  const totalRevenue = metricValue(data, "financialData", "totalRevenue");
+  const freeCashflow = metricValue(data, "financialData", "freeCashflow");
+  const fcfMargin = numberOrNull(freeCashflow) != null && numberOrNull(totalRevenue) ? numberOrNull(freeCashflow) / numberOrNull(totalRevenue) : null;
+  const fcfYield = numberOrNull(freeCashflow) != null && numberOrNull(marketCap) ? numberOrNull(freeCashflow) / numberOrNull(marketCap) : null;
   return [
     {
       title: "1. Profitability / Прибыльность",
       question: "Компания реально зарабатывает деньги и становится ли бизнес эффективнее?",
       metrics: [
-        ["Компания", ticker, `Тикер: ${ticker}. Сектор: ${na}. Индустрия: ${na}.`],
+        ["Компания", fmtMetric(metricValue(data, "price", "shortName") || ticker), `Тикер: ${ticker}. Сектор: ${fmtMetric(metricValue(data, "assetProfile", "sector"))}. Индустрия: ${fmtMetric(metricValue(data, "assetProfile", "industry"))}.`],
         ["Текущая цена", price, "Рыночная цена нужна как отправная точка для сравнения с фундаментальными метриками."],
-        ["Revenue Growth / Рост выручки", na, "Показывает темп роста верхней строки. Ускорение роста обычно поддерживает оценку компании."],
-        ["Gross Margin / Валовая маржа", na, "Показывает ценовую силу продукта и эффективность себестоимости."],
-        ["Operating Margin / Операционная маржа", na, "Показывает прибыльность основного бизнеса после операционных расходов."],
-        ["Net Margin / Чистая маржа", na, "Показывает, сколько прибыли остаётся акционерам после всех расходов."],
-        ["EPS / Прибыль на акцию", na, "EPS показывает прибыль, приходящуюся на одну акцию."],
-        ["EBITDA", na, "Грубая оценка операционной денежной генерации до процентов, налогов и амортизации."],
+        ["Revenue Growth / Рост выручки", fmtPercent(metricValue(data, "financialData", "revenueGrowth")), "Показывает темп роста верхней строки. Ускорение роста обычно поддерживает оценку компании."],
+        ["Gross Margin / Валовая маржа", fmtPercent(metricValue(data, "financialData", "grossMargins")), "Показывает ценовую силу продукта и эффективность себестоимости."],
+        ["Operating Margin / Операционная маржа", fmtPercent(metricValue(data, "financialData", "operatingMargins")), "Показывает прибыльность основного бизнеса после операционных расходов."],
+        ["Net Margin / Чистая маржа", fmtPercent(metricValue(data, "financialData", "profitMargins")), "Показывает, сколько прибыли остаётся акционерам после всех расходов."],
+        ["EPS / Прибыль на акцию", fmtMetric(metricValue(data, "defaultKeyStatistics", "trailingEps")), "EPS показывает прибыль, приходящуюся на одну акцию."],
+        ["EBITDA", fmtMoney(metricValue(data, "financialData", "ebitda")), "Грубая оценка операционной денежной генерации до процентов, налогов и амортизации."],
       ],
     },
     {
       title: "2. Valuation / Оценка стоимости",
       question: "Хорошая ли это компания по разумной цене, или рынок уже заложил слишком много ожиданий?",
       metrics: [
-        ["Market Cap / Капитализация", na, "Размер компании на рынке. Важно сравнивать с выручкой, прибылью и денежным потоком."],
-        ["P/E / Цена к прибыли", na, "Показывает, сколько инвестор платит за доллар текущей прибыли."],
-        ["Forward P/E / Будущий P/E", na, "Использует ожидаемую прибыль и полезен для растущих компаний, но зависит от прогнозов."],
+        ["Market Cap / Капитализация", fmtMoney(marketCap), "Размер компании на рынке. Важно сравнивать с выручкой, прибылью и денежным потоком."],
+        ["P/E / Цена к прибыли", fmtMetric(metricValue(data, "summaryDetail", "trailingPE")), "Показывает, сколько инвестор платит за доллар текущей прибыли."],
+        ["Forward P/E / Будущий P/E", fmtMetric(metricValue(data, "summaryDetail", "forwardPE")), "Использует ожидаемую прибыль и полезен для растущих компаний, но зависит от прогнозов."],
         ["CAPE / Cyclically Adjusted P/E", na, "CAPE сравнивает цену с усреднённой прибылью за длинный цикл. Он помогает увидеть оценку относительно нормализованной прибыли, но для отдельных компаний часто доступен хуже, чем для индексов."],
-        ["P/S / Цена к выручке", na, "Особенно полезен для компаний, где прибыль пока нестабильна."],
-        ["EV / EBITDA", na, "Сравнивает стоимость предприятия с EBITDA и учитывает долг."],
-        ["PEG Ratio", na, "Сравнивает P/E с темпом роста прибыли. Ниже 1 часто выглядит интереснее, но не является автоматическим сигналом."],
-        ["P/B / Цена к балансовой стоимости", na, "Полезно для банков, страховых и капиталоёмких бизнесов."],
+        ["P/S / Цена к выручке", fmtMetric(metricValue(data, "summaryDetail", "priceToSalesTrailing12Months")), "Особенно полезен для компаний, где прибыль пока нестабильна."],
+        ["EV / EBITDA", fmtMetric(metricValue(data, "defaultKeyStatistics", "enterpriseToEbitda")), "Сравнивает стоимость предприятия с EBITDA и учитывает долг."],
+        ["PEG Ratio", fmtMetric(metricValue(data, "defaultKeyStatistics", "pegRatio")), "Сравнивает P/E с темпом роста прибыли. Ниже 1 часто выглядит интереснее, но не является автоматическим сигналом."],
+        ["P/B / Цена к балансовой стоимости", fmtMetric(metricValue(data, "defaultKeyStatistics", "priceToBook")), "Полезно для банков, страховых и капиталоёмких бизнесов."],
       ],
     },
     {
       title: "3. Cash Flow / Денежный поток",
       question: "Настоящая ли прибыль, и превращается ли бизнес в реальные свободные деньги?",
       metrics: [
-        ["Operating Cash Flow / OCF", na, "Деньги, которые компания генерирует основной деятельностью."],
-        ["Free Cash Flow / FCF", na, "Деньги после капитальных расходов, доступные для buybacks, дивидендов, долга или роста."],
-        ["FCF Margin", na, "FCF margin = FCF / выручка. Если данных выручки недостаточно, показатель нужно досчитать из отчётности."],
-        ["FCF Yield", na, "FCF yield = FCF / market cap. Помогает понять доходность свободного денежного потока относительно цены компании."],
+        ["Operating Cash Flow / OCF", fmtMoney(metricValue(data, "financialData", "operatingCashflow")), "Деньги, которые компания генерирует основной деятельностью."],
+        ["Free Cash Flow / FCF", fmtMoney(freeCashflow), "Деньги после капитальных расходов, доступные для buybacks, дивидендов, долга или роста."],
+        ["FCF Margin", fmtPercent(fcfMargin), "FCF margin = FCF / выручка. Если данных выручки недостаточно, показатель нужно досчитать из отчётности."],
+        ["FCF Yield", fmtPercent(fcfYield), "FCF yield = FCF / market cap. Помогает понять доходность свободного денежного потока относительно цены компании."],
       ],
     },
     {
       title: "4. Financial Health / Финансовое здоровье",
       question: "Компания выдержит спад и сможет финансировать рост без разрушения баланса?",
       metrics: [
-        ["Debt-to-Equity / D/E", na, "Показывает финансовый рычаг и риск зависимости от долга."],
-        ["Total Cash / Денежные средства", na, "Запас ликвидности для кризиса, инвестиций, buybacks и погашения долга."],
-        ["Total Debt / Общий долг", na, "Важно сравнивать с cash, EBITDA и денежным потоком."],
-        ["Current Ratio", na, "Показывает способность закрывать ближайшие обязательства текущими активами."],
-        ["ROE / Рентабельность капитала", na, "Показывает эффективность использования капитала акционеров."],
-        ["ROA / Рентабельность активов", na, "Показывает эффективность использования всех активов компании."],
+        ["Debt-to-Equity / D/E", fmtMetric(metricValue(data, "financialData", "debtToEquity")), "Показывает финансовый рычаг и риск зависимости от долга."],
+        ["Total Cash / Денежные средства", fmtMoney(metricValue(data, "financialData", "totalCash")), "Запас ликвидности для кризиса, инвестиций, buybacks и погашения долга."],
+        ["Total Debt / Общий долг", fmtMoney(metricValue(data, "financialData", "totalDebt")), "Важно сравнивать с cash, EBITDA и денежным потоком."],
+        ["Current Ratio", fmtMetric(metricValue(data, "financialData", "currentRatio")), "Показывает способность закрывать ближайшие обязательства текущими активами."],
+        ["ROE / Рентабельность капитала", fmtPercent(metricValue(data, "financialData", "returnOnEquity")), "Показывает эффективность использования капитала акционеров."],
+        ["ROA / Рентабельность активов", fmtPercent(metricValue(data, "financialData", "returnOnAssets")), "Показывает эффективность использования всех активов компании."],
       ],
     },
     {
       title: "5. Forward Signals / Будущие сигналы",
       question: "Куда меняются ожидания по компании?",
       metrics: [
-        ["Recommendation", na, "Сводная рекомендация аналитиков, если источник её предоставляет."],
-        ["Target Mean Price", na, "Средняя целевая цена аналитиков. Это ориентир ожиданий, а не гарантия."],
-        ["Earnings Growth", na, "Рост прибыли поддерживает переоценку, если ожидания подтверждаются."],
-        ["Revenue Growth", na, "Рост выручки показывает направление спроса на продукт или услугу."],
-        ["Beta", na, "Показывает чувствительность акции к рынку. Выше 1 означает более высокую волатильность."],
-        ["Dividend Yield", na, "Доходность дивидендов важна для компаний, где часть инвестиционной идеи связана с выплатами."],
-        ["Технический контекст", `Движение: ${movement}`, `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%.`],
+        ["Recommendation", fmtMetric(metricValue(data, "financialData", "recommendationKey")), "Сводная рекомендация аналитиков, если источник её предоставляет."],
+        ["Target Mean Price", fmtMetric(metricValue(data, "financialData", "targetMeanPrice")), "Средняя целевая цена аналитиков. Это ориентир ожиданий, а не гарантия."],
+        ["Earnings Growth", fmtPercent(metricValue(data, "financialData", "earningsGrowth")), "Рост прибыли поддерживает переоценку, если ожидания подтверждаются."],
+        ["Revenue Growth", fmtPercent(metricValue(data, "financialData", "revenueGrowth")), "Рост выручки показывает направление спроса на продукт или услугу."],
+        ["Beta", fmtMetric(metricValue(data, "summaryDetail", "beta")), "Показывает чувствительность акции к рынку. Выше 1 означает более высокую волатильность."],
+        ["Dividend Yield", fmtPercent(metricValue(data, "summaryDetail", "dividendYield")), "Доходность дивидендов важна для компаний, где часть инвестиционной идеи связана с выплатами."],
+        ["Технический контекст", `Движение: ${movement}`, `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, ATR14: ${valueOrDash(row.atr14)}, MMA150: ${valueOrDash(row.mma150)}, от MMA150: ${distanceText(row.mma150_distance_percent)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%.`],
       ],
     },
   ];
@@ -1041,6 +1111,49 @@ function payloadCountryLabel(country = {}) {
 
 function countSignals(rows) {
   return rows.reduce((sum, row) => sum + (row.signals?.length || 0), 0);
+}
+
+function metricValue(data, section, key) {
+  const value = data?.[section]?.[key];
+  if (value && typeof value === "object") {
+    if ("raw" in value) return value.raw;
+    if ("fmt" in value) return value.fmt;
+  }
+  return value;
+}
+
+function numberOrNull(value) {
+  const normalized = value && typeof value === "object" && "raw" in value ? value.raw : value;
+  const number = Number(normalized);
+  return Number.isFinite(number) ? number : null;
+}
+
+function fmtMetric(value) {
+  if (value == null || value === "" || Number.isNaN(value)) return "н/д";
+  if (value && typeof value === "object") {
+    if ("raw" in value) return fmtMetric(value.raw);
+    if ("fmt" in value) return String(value.fmt);
+    return "н/д";
+  }
+  if (typeof value === "number") return round(value, 2).toString();
+  return String(value);
+}
+
+function fmtPercent(value) {
+  const number = numberOrNull(value);
+  if (number == null) return fmtMetric(value);
+  const percent = Math.abs(number) <= 1 ? number * 100 : number;
+  return `${round(percent, 2)}%`;
+}
+
+function fmtMoney(value) {
+  const number = numberOrNull(value);
+  if (number == null) return fmtMetric(value);
+  const absolute = Math.abs(number);
+  if (absolute >= 1_000_000_000_000) return `$${round(number / 1_000_000_000_000, 2)}T`;
+  if (absolute >= 1_000_000_000) return `$${round(number / 1_000_000_000, 2)}B`;
+  if (absolute >= 1_000_000) return `$${round(number / 1_000_000, 2)}M`;
+  return `$${Math.round(number).toLocaleString("en-US")}`;
 }
 
 function valueOrDash(value) {
