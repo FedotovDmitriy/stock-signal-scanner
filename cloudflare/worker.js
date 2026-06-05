@@ -205,13 +205,23 @@ async function analyzeTickers(tickers, config) {
 
 async function fetchCandles(ticker, timeframe) {
   const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${tf.interval}&range=${tf.range}`;
-  const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!response.ok) throw new Error(`Yahoo chart HTTP ${response.status}`);
-  const data = await response.json();
+  let data = null;
+  let lastError = "";
+  for (const symbol of yahooTickerCandidates(ticker)) {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${tf.interval}&range=${tf.range}`;
+    const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!response.ok) {
+      lastError = `${symbol}: Yahoo chart HTTP ${response.status}`;
+      continue;
+    }
+    data = await response.json();
+    if (data?.chart?.result?.[0]) break;
+    lastError = `${symbol}: ${data?.chart?.error?.description || "нет рыночных данных"}`;
+    data = null;
+  }
   const result = data?.chart?.result?.[0];
   const quote = result?.indicators?.quote?.[0];
-  if (!result || !quote || !Array.isArray(result.timestamp)) throw new Error("ÐÐµÑ‚ Ñ€Ñ‹Ð½Ð¾Ñ‡Ð½Ñ‹Ñ… Ð´Ð°Ð½Ð½Ñ‹Ñ…");
+  if (!result || !quote || !Array.isArray(result.timestamp)) throw new Error(lastError || "Нет рыночных данных");
 
   const candles = [];
   for (let i = 0; i < result.timestamp.length; i += 1) {
@@ -228,6 +238,12 @@ async function fetchCandles(ticker, timeframe) {
   }
   if (candles.length < 60) throw new Error("ÐÐµÐ´Ð¾ÑÑ‚Ð°Ñ‚Ð¾Ñ‡Ð½Ð¾ ÑÐ²ÐµÑ‡ÐµÐ¹ Ð´Ð»Ñ Ð°Ð½Ð°Ð»Ð¸Ð·Ð°");
   return candles;
+}
+
+function yahooTickerCandidates(ticker) {
+  const normalized = String(ticker || "").trim().toUpperCase();
+  if (!normalized || normalized.includes(".")) return [normalized];
+  return [normalized, `${normalized}.TA`];
 }
 
 function analyzeTicker(ticker, candles, config) {

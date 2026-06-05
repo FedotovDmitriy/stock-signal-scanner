@@ -301,7 +301,6 @@ def send_json(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) 
 
 def fetch_candles(ticker: str, timeframe: str) -> list[Candle]:
     config = TIMEFRAMES.get(timeframe, TIMEFRAMES["1d"])
-    safe_ticker = urllib.parse.quote(ticker)
     params = urllib.parse.urlencode(
         {
             "range": config["range"],
@@ -309,11 +308,25 @@ def fetch_candles(ticker: str, timeframe: str) -> list[Candle]:
             "includePrePost": "false",
         }
     )
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{safe_ticker}?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = None
+    last_error = ""
+    for yahoo_ticker in yahoo_ticker_candidates(ticker):
+        safe_ticker = urllib.parse.quote(yahoo_ticker)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{safe_ticker}?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_error = f"{yahoo_ticker}: Yahoo chart HTTP {exc.code}"
+            continue
+        if payload.get("chart", {}).get("result"):
+            break
+        last_error = f"{yahoo_ticker}: {payload.get('chart', {}).get('error', {}).get('description', 'нет данных')}"
+        payload = None
 
+    if payload is None:
+        raise ValueError(f"{ticker}: {last_error or 'нет данных'}")
     result = payload.get("chart", {}).get("result")
     if not result:
         error = payload.get("chart", {}).get("error", {}).get("description", "нет данных")
@@ -352,6 +365,13 @@ def fetch_candles(ticker: str, timeframe: str) -> list[Candle]:
     if len(candles) < 60:
         raise ValueError(f"{ticker}: мало свечей для анализа ({len(candles)})")
     return candles
+
+
+def yahoo_ticker_candidates(ticker: str) -> list[str]:
+    normalized = str(ticker or "").strip().upper()
+    if not normalized or "." in normalized:
+        return [normalized]
+    return [normalized, f"{normalized}.TA"]
 
 
 def fetch_fundamental_data(ticker: str) -> dict[str, Any]:
