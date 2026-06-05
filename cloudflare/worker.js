@@ -98,9 +98,11 @@ async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel 
   if (chatId && delivery.sendToTelegram) {
     if (news) await sendTelegram(env, chatId, newsMessage(normalized), bot);
     await sendTelegram(env, chatId, analysisReportMessage(result), bot);
-    result.sent = [{ ticker: "ALL", strategy: "Analysis report", side: "report" }];
+    result.sent = [{ ticker: "ALL", strategy: "Analysis report", side: "report", destination: "telegram", chatId }];
+    result.reply = { type: "telegram", chatId, delivered: true };
   } else {
     result.sent = [];
+    result.reply = { type: "http", delivered: true };
   }
 
   await addLog(
@@ -800,7 +802,7 @@ function normalizeExternalPayload(payload, env) {
       displayName: stringOrNull(bot.displayName || bot.display_name),
       tokenSecretName: stringOrNull(bot.tokenSecretName || bot.token_secret_name),
     },
-    chatId: String(payload.telegramChatId || payload.chatId || env.TELEGRAM_CHAT_ID || "").trim(),
+    chatId: extractReplyChatId(payload, env),
     news: normalizeNews(payload.news),
     tickers,
     timeframe: analysis.timeframe || payload.timeframe || env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
@@ -1123,6 +1125,22 @@ function telegramCountry(message, request) {
 
 function payloadCountryLabel(country = {}) {
   return country.iso2 || country.name || country.id || "-";
+}
+
+function extractReplyChatId(payload = {}, env = {}) {
+  const candidates = [
+    payload.telegramChatId,
+    payload.chatId,
+    payload.telegram?.chatId,
+    payload.telegram?.chat_id,
+    payload.telegram?.chat?.id,
+    payload.chat?.id,
+    payload.message?.chat?.id,
+    payload.update?.message?.chat?.id,
+    env.TELEGRAM_CHAT_ID,
+  ];
+  const value = candidates.find((candidate) => candidate != null && String(candidate).trim());
+  return value == null ? "" : String(value).trim();
 }
 
 function countSignals(rows) {

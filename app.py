@@ -2368,16 +2368,27 @@ def run_external_analysis(payload: dict[str, Any], origin: str, provided_token: 
     for key in ["timeframe", "risk", "anchorBars", "strategies"]:
         if key in payload:
             request_config[key] = payload[key]
-    chat_id = str(payload.get("telegramChatId") or payload.get("chatId") or "").strip()
+    chat_id = extract_reply_chat_id(payload)
     if chat_id:
         request_config["telegramChatId"] = chat_id
-    if not str(request_config.get("telegramToken", "")).strip():
-        raise ValueError("В настройках нет Telegram Bot token")
-    if not str(request_config.get("telegramChatId", "")).strip():
-        raise ValueError("В настройках нет Telegram Chat ID для отправки сигнала")
 
     add_request_log(origin, "External webhook", parsed_tickers, "accepted")
     return run_analysis(request_config, notify=True)
+
+
+def extract_reply_chat_id(payload: dict[str, Any]) -> str:
+    candidates = [
+        payload.get("telegramChatId"),
+        payload.get("chatId"),
+        (payload.get("telegram") or {}).get("chatId") if isinstance(payload.get("telegram"), dict) else None,
+        (payload.get("telegram") or {}).get("chat_id") if isinstance(payload.get("telegram"), dict) else None,
+        ((payload.get("telegram") or {}).get("chat") or {}).get("id") if isinstance(payload.get("telegram"), dict) and isinstance((payload.get("telegram") or {}).get("chat"), dict) else None,
+        (payload.get("chat") or {}).get("id") if isinstance(payload.get("chat"), dict) else None,
+        ((payload.get("message") or {}).get("chat") or {}).get("id") if isinstance(payload.get("message"), dict) and isinstance((payload.get("message") or {}).get("chat"), dict) else None,
+        (((payload.get("update") or {}).get("message") or {}).get("chat") or {}).get("id") if isinstance(payload.get("update"), dict) and isinstance((payload.get("update") or {}).get("message"), dict) and isinstance(((payload.get("update") or {}).get("message") or {}).get("chat"), dict) else None,
+    ]
+    value = next((candidate for candidate in candidates if candidate is not None and str(candidate).strip()), "")
+    return str(value).strip()
 
 
 def should_run_now(start: str, end: str) -> bool:
@@ -2431,7 +2442,10 @@ def run_analysis(config: dict[str, Any], notify: bool = True) -> dict[str, Any]:
     }
     if notify and token and chat_id:
         send_telegram(token, chat_id, analysis_report_message(result))
-        sent.append({"ticker": "ALL", "strategy": "Analysis report", "side": "report"})
+        sent.append({"ticker": "ALL", "strategy": "Analysis report", "side": "report", "destination": "telegram", "chatId": chat_id})
+        result["reply"] = {"type": "telegram", "chatId": chat_id, "delivered": True}
+    else:
+        result["reply"] = {"type": "http", "delivered": True}
     result = update_analysis_results(result)
     scheduler_state["last_run"] = result["timestamp"]
     scheduler_state["last_result"] = result
