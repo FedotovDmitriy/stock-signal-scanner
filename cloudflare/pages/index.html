@@ -34,6 +34,25 @@
       display: grid;
       gap: 18px;
     }
+    .hidden { display: none !important; }
+    .login-screen {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 22px;
+    }
+    .login-card {
+      width: min(440px, 100%);
+      padding: 20px;
+      display: grid;
+      gap: 14px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .login-card h1 { font-size: 24px; }
+    .login-card p { margin: 0; color: var(--muted); }
     header {
       display: grid;
       grid-template-columns: minmax(260px, 1fr) minmax(360px, 560px);
@@ -210,7 +229,24 @@
   </style>
 </head>
 <body>
-  <div class="shell">
+  <div class="login-screen" id="loginScreen">
+    <div class="login-card">
+      <div>
+        <h1>Stock Signal Scanner</h1>
+        <p>Вход в мониторинг и админ-панель</p>
+      </div>
+      <label>Среда
+        <select id="loginEnv"></select>
+      </label>
+      <label>Admin token
+        <input id="loginAdminToken" type="password" autocomplete="off" placeholder="ADMIN_TOKEN">
+      </label>
+      <button id="loginBtn" type="button">Войти</button>
+      <div class="toast" id="loginToast"></div>
+    </div>
+  </div>
+
+  <div class="shell hidden" id="dashboardShell">
     <header>
       <div>
         <h1>Stock Signal Scanner</h1>
@@ -409,6 +445,7 @@
       if (saved[id]) $(id).value = saved[id];
     });
     if (saved.adminToken) $("adminToken").value = saved.adminToken;
+    if (saved.adminToken) $("loginAdminToken").value = saved.adminToken;
 
     function envOptions() {
       return Object.entries(environments).map(([key, env]) => `<option value="${esc(key)}">${esc(env.label || key)}</option>`).join("");
@@ -417,9 +454,11 @@
       return environments[activeEnv] || environments.dev;
     }
     function renderEnvControls() {
+      $("loginEnv").innerHTML = envOptions();
       $("headerActiveEnv").innerHTML = envOptions();
       $("activeEnv").innerHTML = envOptions();
       $("settingsEnv").innerHTML = envOptions();
+      $("loginEnv").value = activeEnv;
       $("headerActiveEnv").value = activeEnv;
       $("activeEnv").value = activeEnv;
       $("settingsEnv").value = activeEnv;
@@ -458,7 +497,7 @@
     }
     async function adminApi(path, options = {}) {
       saveLocal();
-      const token = $("adminToken").value.trim();
+      const token = ($("adminToken").value || $("loginAdminToken").value).trim();
       if (!token) throw new Error("Введите ADMIN_TOKEN");
       const headers = { "Cache-Control": "no-store", ...(options.headers || {}), "X-Admin-Token": token };
       const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
@@ -628,6 +667,19 @@
       $("adminPanel").classList.add("open");
       $("toast").textContent = "Админ доступ активен";
     }
+    async function login() {
+      activeEnv = $("loginEnv").value || activeEnv;
+      $("adminToken").value = $("loginAdminToken").value.trim();
+      renderEnvControls();
+      const data = await adminApi("/api/admin/access-list");
+      renderAccessList(data);
+      $("adminPanel").classList.add("open");
+      $("loginScreen").classList.add("hidden");
+      $("dashboardShell").classList.remove("hidden");
+      saveLocal();
+      await refresh();
+      $("toast").textContent = "Админ доступ активен";
+    }
     async function refresh() {
       const state = await api(`/api/status?ts=${Date.now()}`);
       renderStatus(state);
@@ -646,6 +698,23 @@
     });
     $("headerActiveEnv").addEventListener("change", () => changeActiveEnv($("headerActiveEnv").value));
     $("activeEnv").addEventListener("change", () => changeActiveEnv($("activeEnv").value));
+    $("loginEnv").addEventListener("change", () => {
+      activeEnv = $("loginEnv").value;
+      renderEnvControls();
+      saveLocal();
+    });
+    $("loginBtn").addEventListener("click", async () => {
+      $("loginBtn").disabled = true;
+      $("loginToast").textContent = "Проверяю доступ...";
+      try {
+        await login();
+        $("loginToast").textContent = "";
+      } catch (error) {
+        $("loginToast").textContent = error.message;
+      } finally {
+        $("loginBtn").disabled = false;
+      }
+    });
     $("settingsEnv").addEventListener("change", renderEnvSettings);
     $("saveEnvBtn").addEventListener("click", async () => {
       const key = $("settingsEnv").value || activeEnv;
