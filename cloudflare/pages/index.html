@@ -106,6 +106,19 @@
       background: var(--panel-2);
     }
     .settings-panel.open { display: grid; }
+    .admin-list { display: grid; gap: 8px; }
+    .admin-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #11171a;
+      font-size: 12px;
+    }
+    .admin-row button { min-height: 34px; padding: 7px 9px; }
     .checks { display: grid; gap: 8px; }
     .check {
       display: flex;
@@ -243,6 +256,34 @@
         </div>
 
         <div>
+          <div class="section-title">Админ доступ</div>
+          <label>Admin token
+            <input id="adminToken" type="password" autocomplete="off" placeholder="ADMIN_TOKEN из Worker secret">
+          </label>
+          <div class="actions">
+            <button class="secondary" id="adminLoginBtn" type="button">Войти</button>
+            <button class="secondary" id="loadAccessBtn" type="button">Обновить</button>
+          </div>
+          <div class="settings-panel" id="adminPanel">
+            <label>Allowed user id
+              <input id="allowedUserId" placeholder="Telegram user id">
+            </label>
+            <label>Username / note
+              <input id="allowedUserNote" placeholder="@username или заметка">
+            </label>
+            <button class="secondary" id="addAllowedUserBtn" type="button">Добавить user</button>
+            <label>Allowed chat id
+              <input id="allowedChatId" placeholder="Telegram chat id">
+            </label>
+            <label>Title / note
+              <input id="allowedChatNote" placeholder="Название чата или заметка">
+            </label>
+            <button class="secondary" id="addAllowedChatBtn" type="button">Добавить chat</button>
+            <div class="admin-list" id="accessList"><div class="empty">Войдите как админ</div></div>
+          </div>
+        </div>
+
+        <div>
           <div class="section-title">Анализ</div>
           <label>Тикеры
             <textarea id="tickers">AAPL, MSFT, NVDA</textarea>
@@ -367,6 +408,7 @@
     ["telegramChatId", "botId"].forEach((id) => {
       if (saved[id]) $(id).value = saved[id];
     });
+    if (saved.adminToken) $("adminToken").value = saved.adminToken;
 
     function envOptions() {
       return Object.entries(environments).map(([key, env]) => `<option value="${esc(key)}">${esc(env.label || key)}</option>`).join("");
@@ -397,6 +439,7 @@
         environments,
         telegramChatId: $("telegramChatId").value.trim(),
         botId: $("botId").value.trim(),
+        adminToken: $("adminToken").value.trim(),
       }));
     }
     function baseUrl() {
@@ -411,6 +454,16 @@
       const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Ошибка запроса");
+      return data;
+    }
+    async function adminApi(path, options = {}) {
+      saveLocal();
+      const token = $("adminToken").value.trim();
+      if (!token) throw new Error("Введите ADMIN_TOKEN");
+      const headers = { "Cache-Control": "no-store", ...(options.headers || {}), "X-Admin-Token": token };
+      const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Ошибка admin запроса");
       return data;
     }
     function payload() {
@@ -528,6 +581,53 @@
         </div>
       `).join("") : `<div class="empty">Пока запросов нет</div>`;
     }
+    function renderAccessList(data) {
+      const users = data.users || [];
+      const chats = data.chats || [];
+      const rows = [
+        ...users.map((user) => ({
+          type: "user",
+          id: user.telegram_user_id,
+          label: `${user.telegram_user_id}${user.username ? ` · ${user.username}` : ""}`,
+          note: user.note || "",
+          enabled: Boolean(user.enabled),
+        })),
+        ...chats.map((chat) => ({
+          type: "chat",
+          id: chat.telegram_chat_id,
+          label: `${chat.telegram_chat_id}${chat.title ? ` · ${chat.title}` : ""}`,
+          note: chat.note || "",
+          enabled: Boolean(chat.enabled),
+        })),
+      ];
+      $("accessList").innerHTML = rows.length ? rows.map((row) => `
+        <div class="admin-row">
+          <div>
+            <strong>${esc(row.type)}: ${esc(row.label)}</strong><br>
+            <span class="${row.enabled ? "long" : "none"}">${row.enabled ? "active" : "disabled"}</span>
+            ${row.note ? `<br><span>${esc(row.note)}</span>` : ""}
+          </div>
+          <button class="danger" data-access-type="${esc(row.type)}" data-access-id="${esc(row.id)}" type="button">Отключить</button>
+        </div>
+      `).join("") : `<div class="empty">Allowed list пустой. Пока список пуст, Telegram доступ открыт.</div>`;
+      document.querySelectorAll("[data-access-type]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const type = button.dataset.accessType;
+          const id = button.dataset.accessId;
+          try {
+            const data = await adminApi(`/api/admin/allowed-${type}s/${encodeURIComponent(id)}`, { method: "DELETE" });
+            renderAccessList(data);
+            $("toast").textContent = "Запись отключена";
+          } catch (error) { $("toast").textContent = error.message; }
+        });
+      });
+    }
+    async function loadAccessList() {
+      const data = await adminApi("/api/admin/access-list");
+      renderAccessList(data);
+      $("adminPanel").classList.add("open");
+      $("toast").textContent = "Админ доступ активен";
+    }
     async function refresh() {
       const state = await api(`/api/status?ts=${Date.now()}`);
       renderStatus(state);
@@ -558,6 +658,44 @@
       renderEnvControls();
       saveLocal();
       try { await refresh(); $("toast").textContent = "Среда сохранена"; } catch (error) { $("toast").textContent = error.message; }
+    });
+    $("adminLoginBtn").addEventListener("click", async () => {
+      try { await loadAccessList(); } catch (error) { $("toast").textContent = error.message; }
+    });
+    $("loadAccessBtn").addEventListener("click", async () => {
+      try { await loadAccessList(); } catch (error) { $("toast").textContent = error.message; }
+    });
+    $("addAllowedUserBtn").addEventListener("click", async () => {
+      try {
+        const data = await adminApi("/api/admin/allowed-users", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            telegramUserId: $("allowedUserId").value.trim(),
+            note: $("allowedUserNote").value.trim(),
+          }),
+        });
+        $("allowedUserId").value = "";
+        $("allowedUserNote").value = "";
+        renderAccessList(data);
+        $("toast").textContent = "User добавлен";
+      } catch (error) { $("toast").textContent = error.message; }
+    });
+    $("addAllowedChatBtn").addEventListener("click", async () => {
+      try {
+        const data = await adminApi("/api/admin/allowed-chats", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            telegramChatId: $("allowedChatId").value.trim(),
+            note: $("allowedChatNote").value.trim(),
+          }),
+        });
+        $("allowedChatId").value = "";
+        $("allowedChatNote").value = "";
+        renderAccessList(data);
+        $("toast").textContent = "Chat добавлен";
+      } catch (error) { $("toast").textContent = error.message; }
     });
     $("refreshBtn").addEventListener("click", async () => {
       setBusy(true);

@@ -25,7 +25,7 @@ export default {
         return json({
           ok: true,
           service: "stock-signal-scanner-cloudflare",
-          endpoints: ["/api/status", "/scan", "/api/external/analyze", "/api/webhook/analyze", "/api/test-telegram", "/api/clear-logs", "/telegram/webhook"],
+          endpoints: ["/api/status", "/api/admin/access-list", "/scan", "/api/external/analyze", "/api/webhook/analyze", "/api/test-telegram", "/api/clear-logs", "/telegram/webhook"],
         });
       }
       if (request.method === "GET" && url.pathname === "/api/status") {
@@ -40,6 +40,32 @@ export default {
           logs,
           stats,
         });
+      }
+      if (request.method === "GET" && url.pathname === "/api/admin/access-list") {
+        assertAdminToken(request, env);
+        return json(await adminAccessList(env));
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/allowed-users") {
+        const payload = await readJson(request);
+        assertAdminToken(request, env, payload);
+        await saveAllowedUser(env, payload);
+        return json(await adminAccessList(env));
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/allowed-chats") {
+        const payload = await readJson(request);
+        assertAdminToken(request, env, payload);
+        await saveAllowedChat(env, payload);
+        return json(await adminAccessList(env));
+      }
+      if (request.method === "DELETE" && url.pathname.startsWith("/api/admin/allowed-users/")) {
+        assertAdminToken(request, env);
+        await setAllowedUserEnabled(env, decodeURIComponent(url.pathname.split("/").pop() || ""), 0);
+        return json(await adminAccessList(env));
+      }
+      if (request.method === "DELETE" && url.pathname.startsWith("/api/admin/allowed-chats/")) {
+        assertAdminToken(request, env);
+        await setAllowedChatEnabled(env, decodeURIComponent(url.pathname.split("/").pop() || ""), 0);
+        return json(await adminAccessList(env));
       }
       if (request.method === "POST" && ["/scan", "/api/external/analyze", "/api/webhook/analyze"].includes(url.pathname)) {
         const payload = await readJson(request);
@@ -125,6 +151,12 @@ async function handleTelegramUpdate(update, env, request) {
   const origin = telegramOrigin(message, request);
   const country = telegramCountry(message, request);
   if (!chatId || !text) return;
+
+  if (!(await isTelegramAllowed(env, message))) {
+    await addLog(env, origin, "Telegram access", "-", "denied", "not in allowed_users or allowed_chats", country);
+    await sendTelegram(env, chatId, "Доступ закрыт. Напишите администратору, чтобы добавить ваш user id или chat id в allowed list.");
+    return;
+  }
 
   const reportCommand = parseTelegramReportCommand(text);
   if (reportCommand) {
@@ -970,6 +1002,80 @@ async function clearLogs(env) {
   await env.DB.prepare("DELETE FROM request_logs").run();
 }
 
+async function ensureAccessTables(env) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS allowed_users (telegram_user_id TEXT PRIMARY KEY, username TEXT, note TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+  ).run();
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS allowed_chats (telegram_chat_id TEXT PRIMARY KEY, title TEXT, chat_type TEXT, note TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+  ).run();
+}
+
+async function adminAccessList(env) {
+  if (!env.DB) return { ok: true, users: [], chats: [] };
+  await ensureAccessTables(env);
+  const [users, chats] = await Promise.all([
+    env.DB.prepare("SELECT telegram_user_id, username, note, enabled, created_at, updated_at FROM allowed_users ORDER BY updated_at DESC").all(),
+    env.DB.prepare("SELECT telegram_chat_id, title, chat_type, note, enabled, created_at, updated_at FROM allowed_chats ORDER BY updated_at DESC").all(),
+  ]);
+  return { ok: true, users: users.results || [], chats: chats.results || [] };
+}
+
+async function saveAllowedUser(env, payload) {
+  if (!env.DB) throw httpError("D1 DB is not configured", 500);
+  await ensureAccessTables(env);
+  const telegramUserId = String(payload.telegramUserId || payload.telegram_user_id || payload.userId || "").trim();
+  if (!telegramUserId) throw httpError("telegramUserId is required", 400);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO allowed_users (telegram_user_id, username, note, enabled, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(telegram_user_id) DO UPDATE SET username=excluded.username, note=excluded.note, enabled=excluded.enabled, updated_at=excluded.updated_at`
+  ).bind(telegramUserId, payload.username || "", payload.note || "", payload.enabled === false ? 0 : 1, now, now).run();
+}
+
+async function saveAllowedChat(env, payload) {
+  if (!env.DB) throw httpError("D1 DB is not configured", 500);
+  await ensureAccessTables(env);
+  const telegramChatId = String(payload.telegramChatId || payload.telegram_chat_id || payload.chatId || "").trim();
+  if (!telegramChatId) throw httpError("telegramChatId is required", 400);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO allowed_chats (telegram_chat_id, title, chat_type, note, enabled, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(telegram_chat_id) DO UPDATE SET title=excluded.title, chat_type=excluded.chat_type, note=excluded.note, enabled=excluded.enabled, updated_at=excluded.updated_at`
+  ).bind(telegramChatId, payload.title || "", payload.chatType || payload.chat_type || "", payload.note || "", payload.enabled === false ? 0 : 1, now, now).run();
+}
+
+async function setAllowedUserEnabled(env, telegramUserId, enabled) {
+  if (!env.DB) throw httpError("D1 DB is not configured", 500);
+  await ensureAccessTables(env);
+  await env.DB.prepare("UPDATE allowed_users SET enabled = ?, updated_at = ? WHERE telegram_user_id = ?").bind(enabled, new Date().toISOString(), telegramUserId).run();
+}
+
+async function setAllowedChatEnabled(env, telegramChatId, enabled) {
+  if (!env.DB) throw httpError("D1 DB is not configured", 500);
+  await ensureAccessTables(env);
+  await env.DB.prepare("UPDATE allowed_chats SET enabled = ?, updated_at = ? WHERE telegram_chat_id = ?").bind(enabled, new Date().toISOString(), telegramChatId).run();
+}
+
+async function isTelegramAllowed(env, message) {
+  if (!env.DB) return true;
+  await ensureAccessTables(env);
+  const userId = String(message.from?.id || "").trim();
+  const chatId = String(message.chat?.id || "").trim();
+  const counts = await env.DB.prepare(
+    "SELECT (SELECT COUNT(*) FROM allowed_users WHERE enabled = 1) AS users, (SELECT COUNT(*) FROM allowed_chats WHERE enabled = 1) AS chats"
+  ).first();
+  if (!Number(counts?.users || 0) && !Number(counts?.chats || 0)) return true;
+  const [user, chat] = await Promise.all([
+    userId ? env.DB.prepare("SELECT telegram_user_id FROM allowed_users WHERE telegram_user_id = ? AND enabled = 1").bind(userId).first() : null,
+    chatId ? env.DB.prepare("SELECT telegram_chat_id FROM allowed_chats WHERE telegram_chat_id = ? AND enabled = 1").bind(chatId).first() : null,
+  ]);
+  return Boolean(user || chat);
+}
+
 function ema(values, period) {
   if (values.length < period) return null;
   const k = 2 / (period + 1);
@@ -1100,6 +1206,15 @@ function assertWebhookToken(request, env, payload) {
   const bearer = authorization.toLowerCase().startsWith("bearer ") ? authorization.slice(7).trim() : "";
   const provided = request.headers.get("X-Scanner-Token") || bearer || payload.token || payload.apiToken || "";
   if (provided !== expected) throw httpError("ÐÐµÐ²ÐµÑ€Ð½Ñ‹Ð¹ Webhook/API token", 403);
+}
+
+function assertAdminToken(request, env, payload = {}) {
+  const expected = String(env.ADMIN_TOKEN || "").trim();
+  if (!expected) throw httpError("ADMIN_TOKEN не задан", 500);
+  const authorization = request.headers.get("Authorization") || "";
+  const bearer = authorization.toLowerCase().startsWith("bearer ") ? authorization.slice(7).trim() : "";
+  const provided = request.headers.get("X-Admin-Token") || bearer || payload.adminToken || "";
+  if (provided !== expected) throw httpError("Неверный admin token", 403);
 }
 
 function telegramOrigin(message, request) {
