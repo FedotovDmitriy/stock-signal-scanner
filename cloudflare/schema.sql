@@ -214,6 +214,25 @@ CREATE TABLE IF NOT EXISTS api_clients (
   last_used_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS allowed_users (
+  telegram_user_id TEXT PRIMARY KEY,
+  username TEXT,
+  note TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS allowed_chats (
+  telegram_chat_id TEXT PRIMARY KEY,
+  title TEXT,
+  chat_type TEXT,
+  note TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id TEXT PRIMARY KEY,
   actor_type TEXT NOT NULL,
@@ -237,6 +256,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(time);
+CREATE INDEX IF NOT EXISTS idx_allowed_users_enabled ON allowed_users(enabled);
+CREATE INDEX IF NOT EXISTS idx_allowed_chats_enabled ON allowed_chats(enabled);
 CREATE INDEX IF NOT EXISTS idx_users_telegram_user_id ON users(telegram_user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_paid_until ON subscriptions(paid_until);
