@@ -440,16 +440,19 @@
         label: "Dev",
         apiBase: "https://stock-signal-scanner-dev.fnemoy.workers.dev",
         apiToken: "",
+        useProxy: true,
       },
       prod: {
         label: "Prod",
         apiBase: "https://stock-signal-scanner-production.fnemoy.workers.dev",
         apiToken: "",
+        useProxy: true,
       },
       custom: {
         label: "Custom",
         apiBase: "",
         apiToken: "",
+        useProxy: false,
       },
     };
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -519,8 +522,12 @@
       if (!/^https:\/\/[^/]+/.test(value)) throw new Error(`Неверный Worker API URL: ${value}`);
       return value;
     }
+    function requestUrl(path) {
+      if (currentEnv().useProxy && (activeEnv === "dev" || activeEnv === "prod")) return path;
+      return `${baseUrl()}${path}`;
+    }
     async function fetchJson(path, options = {}) {
-      const url = `${baseUrl()}${path}`;
+      const url = requestUrl(path);
       try {
         const response = await fetch(url, options);
         const data = await response.json();
@@ -528,7 +535,7 @@
         return data;
       } catch (error) {
         if (error.message === "Failed to fetch") {
-          throw new Error(`Не удалось подключиться к Worker: ${baseUrl()}. Нажмите "Сбросить настройки" и выберите Dev.`);
+          throw new Error(`Не удалось подключиться к Worker: ${currentEnv().useProxy ? "Pages proxy" : baseUrl()}. Нажмите "Сбросить настройки" и выберите Dev.`);
         }
         throw error;
       }
@@ -536,6 +543,7 @@
     async function api(path, options = {}) {
       saveLocal();
       const headers = { "Cache-Control": "no-store", ...(options.headers || {}) };
+      if (currentEnv().useProxy) headers["X-Monitor-Env"] = activeEnv;
       if (currentEnv().apiToken) headers["X-Scanner-Token"] = currentEnv().apiToken;
       return fetchJson(path, { ...options, headers });
     }
@@ -544,6 +552,7 @@
       const token = ($("adminToken").value || $("loginAdminToken").value).trim();
       if (!token) throw new Error("Введите ADMIN_TOKEN");
       const headers = { "Cache-Control": "no-store", ...(options.headers || {}), "X-Admin-Token": token };
+      if (currentEnv().useProxy) headers["X-Monitor-Env"] = activeEnv;
       return fetchJson(path, { ...options, headers });
     }
     function payload() {
@@ -783,6 +792,7 @@
         label: $("envLabel").value.trim() || key,
         apiBase: $("envApiBase").value.trim().replace(/\/+$/, ""),
         apiToken: $("envApiToken").value,
+        useProxy: key === "dev" || key === "prod",
       };
       activeEnv = key;
       renderEnvControls();
