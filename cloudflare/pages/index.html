@@ -242,6 +242,7 @@
         <input id="loginAdminToken" type="password" autocomplete="off" placeholder="ADMIN_TOKEN">
       </label>
       <button id="loginBtn" type="button">Войти</button>
+      <button class="secondary" id="resetLoginSettingsBtn" type="button">Сбросить настройки</button>
       <div class="toast" id="loginToast"></div>
     </div>
   </div>
@@ -515,26 +516,35 @@
     function baseUrl() {
       const value = String(currentEnv().apiBase || "").trim().replace(/\/+$/, "");
       if (!value) throw new Error("Укажите Worker API URL в настройках выбранной среды");
+      if (!/^https:\/\/[^/]+/.test(value)) throw new Error(`Неверный Worker API URL: ${value}`);
       return value;
+    }
+    async function fetchJson(path, options = {}) {
+      const url = `${baseUrl()}${path}`;
+      try {
+        const response = await fetch(url, options);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Ошибка запроса");
+        return data;
+      } catch (error) {
+        if (error.message === "Failed to fetch") {
+          throw new Error(`Не удалось подключиться к Worker: ${baseUrl()}. Нажмите "Сбросить настройки" и выберите Dev.`);
+        }
+        throw error;
+      }
     }
     async function api(path, options = {}) {
       saveLocal();
       const headers = { "Cache-Control": "no-store", ...(options.headers || {}) };
       if (currentEnv().apiToken) headers["X-Scanner-Token"] = currentEnv().apiToken;
-      const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Ошибка запроса");
-      return data;
+      return fetchJson(path, { ...options, headers });
     }
     async function adminApi(path, options = {}) {
       saveLocal();
       const token = ($("adminToken").value || $("loginAdminToken").value).trim();
       if (!token) throw new Error("Введите ADMIN_TOKEN");
       const headers = { "Cache-Control": "no-store", ...(options.headers || {}), "X-Admin-Token": token };
-      const response = await fetch(`${baseUrl()}${path}`, { ...options, headers });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Ошибка admin запроса");
-      return data;
+      return fetchJson(path, { ...options, headers });
     }
     function payload() {
       return {
@@ -761,6 +771,10 @@
       } finally {
         $("loginBtn").disabled = false;
       }
+    });
+    $("resetLoginSettingsBtn").addEventListener("click", () => {
+      localStorage.removeItem("scannerMonitor");
+      window.location.reload();
     });
     $("settingsEnv").addEventListener("change", renderEnvSettings);
     $("saveEnvBtn").addEventListener("click", async () => {
