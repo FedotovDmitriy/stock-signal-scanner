@@ -400,6 +400,29 @@
 
         <div class="panel">
           <div class="toolbar">
+            <strong>Полученные тикеры</strong>
+            <span class="pill" id="tickerLogCount">0 записей</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Время</th>
+                  <th>Источник</th>
+                  <th>Тикеры</th>
+                  <th>Страна</th>
+                  <th>Chat ID</th>
+                  <th>User ID</th>
+                  <th>Статус</th>
+                </tr>
+              </thead>
+              <tbody id="tickerRows"><tr><td colspan="7" class="empty">Пока тикеров нет</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
             <strong>Логи запросов</strong>
             <span class="pill" id="logCount">0 записей</span>
           </div>
@@ -527,6 +550,7 @@
       $("updatedAt").textContent = state.time || "-";
       renderResultLogs(state.logs || []);
       renderRequestChart(state.logs || []);
+      renderTickerLogs(state.tickerLogs || []);
       renderLogs(state.logs || []);
     }
     function renderResultLogs(logs) {
@@ -604,6 +628,21 @@
         ctx.fillText(label, x + barWidth / 2, height - 16);
         ctx.fillStyle = "#26c485";
       });
+    }
+    function renderTickerLogs(logs) {
+      const latest = (logs || []).slice(0, 20);
+      $("tickerLogCount").textContent = `${latest.length} записей`;
+      $("tickerRows").innerHTML = latest.length ? latest.map((log) => `
+        <tr>
+          <td>${esc(log.time || "-")}</td>
+          <td>${esc(log.source || "-")}</td>
+          <td class="ticker">${esc(log.tickers || "-")}</td>
+          <td>${esc(log.country || "-")}</td>
+          <td>${esc(log.chat_id || "-")}</td>
+          <td>${esc(log.user_id || "-")}</td>
+          <td><span class="${log.status === "received" || log.status === "ok" ? "long" : log.status === "error" ? "short" : "none"}">${esc(log.status || "-")}</span></td>
+        </tr>
+      `).join("") : `<tr><td colspan="7" class="empty">Пока тикеров нет</td></tr>`;
     }
     function renderLogs(logs) {
       $("logCount").textContent = `${logs.length} записей`;

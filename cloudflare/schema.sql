@@ -255,7 +255,21 @@ CREATE TABLE IF NOT EXISTS request_logs (
   detail TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS ticker_request_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  time TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  source TEXT NOT NULL,
+  tickers TEXT NOT NULL,
+  status TEXT NOT NULL,
+  country TEXT NOT NULL DEFAULT '-',
+  chat_id TEXT,
+  user_id TEXT,
+  detail TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(time);
+CREATE INDEX IF NOT EXISTS idx_ticker_request_logs_time ON ticker_request_logs(time);
 CREATE INDEX IF NOT EXISTS idx_allowed_users_enabled ON allowed_users(enabled);
 CREATE INDEX IF NOT EXISTS idx_allowed_chats_enabled ON allowed_chats(enabled);
 CREATE INDEX IF NOT EXISTS idx_users_telegram_user_id ON users(telegram_user_id);
