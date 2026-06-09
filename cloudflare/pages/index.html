@@ -462,7 +462,15 @@
     for (const [key, env] of Object.entries(saved.environments || {})) {
       environments[key] = { ...(DEFAULT_ENVS[key] || {}), ...env };
     }
-    if (!environments.prod.apiBase) environments.prod.apiBase = DEFAULT_ENVS.prod.apiBase;
+    function repairDefaultEnvUrl(key) {
+      const env = environments[key] || {};
+      const apiBase = String(env.apiBase || "").trim();
+      if (!apiBase || apiBase.includes(".example.workers.dev")) {
+        environments[key] = { ...env, apiBase: DEFAULT_ENVS[key].apiBase };
+      }
+    }
+    repairDefaultEnvUrl("dev");
+    repairDefaultEnvUrl("prod");
     let activeEnv = environments[saved.activeEnv] ? saved.activeEnv : "dev";
     ["telegramChatId", "botId"].forEach((id) => {
       if (saved[id]) $(id).value = saved[id];
