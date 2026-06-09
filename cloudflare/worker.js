@@ -1416,8 +1416,8 @@ function corsResponse(body, status = 200, headers = {}) {
     headers: {
       ...headers,
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Scanner-Token",
+      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Scanner-Token, X-Admin-Token",
       "Access-Control-Max-Age": "86400",
     },
   });
