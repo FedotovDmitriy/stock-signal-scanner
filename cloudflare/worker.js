@@ -30,6 +30,7 @@ export default {
       }
       if (request.method === "GET" && url.pathname === "/api/status") {
         const logs = await latestLogs(env);
+        const tickerLogs = await latestTickerLogs(env);
         const stats = await latestStats(env);
         return json({
           ok: true,
@@ -38,6 +39,7 @@ export default {
           defaultTimeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
           worker: "online",
           logs,
+          tickerLogs,
           stats,
         });
       }
@@ -112,6 +114,15 @@ async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel 
   const newsId = news?.id || (news ? requestKey : null);
 
   const logCountry = requestCountryLabel && requestCountryLabel !== "-" ? requestCountryLabel : payloadCountryLabel(country);
+  await addTickerRequestLog(env, {
+    origin,
+    source: normalized.source || "external",
+    tickers,
+    status: "received",
+    country: logCountry,
+    chatId,
+    detail: `timeframe=${timeframe}; request=${requestKey}`,
+  });
   await addLog(env, origin, "External analysis", tickers.join(", "), "started", `timeframe=${timeframe}; request=${requestKey}`, logCountry);
   if (env.DB) await storeMatcherPayload(env, normalized, newsId);
   const result = await analyzeTickers(tickers, { timeframe, strategies, risk, anchorBars });
@@ -160,7 +171,7 @@ async function handleTelegramUpdate(update, env, request) {
 
   const reportCommand = parseTelegramReportCommand(text);
   if (reportCommand) {
-    await handleTelegramReportCommand(reportCommand, env, chatId, origin, country);
+    await handleTelegramReportCommand(reportCommand, env, chatId, origin, country, telegramUserId(message));
     return;
   }
 
@@ -170,6 +181,16 @@ async function handleTelegramUpdate(update, env, request) {
     return;
   }
 
+  await addTickerRequestLog(env, {
+    origin,
+    source: "telegram",
+    tickers,
+    status: "received",
+    country,
+    chatId,
+    userId: telegramUserId(message),
+    detail: chat.title || chat.username || "",
+  });
   await addLog(env, origin, "Telegram analysis", tickers.join(", "), "started", "", country);
   const result = await analyzeTickers(tickers, {
     timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
@@ -181,13 +202,23 @@ async function handleTelegramUpdate(update, env, request) {
   await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`, country);
 }
 
-async function handleTelegramReportCommand(command, env, chatId, origin, country = "-") {
+async function handleTelegramReportCommand(command, env, chatId, origin, country = "-", userId = "") {
   if (!command.tickers.length) {
     await sendTelegram(env, chatId, `Напишите команду с тикером, например: ${command.label} AAPL`);
     return;
   }
 
   await addLog(env, origin, command.label, command.tickers.join(", "), "started", "", country);
+  await addTickerRequestLog(env, {
+    origin,
+    source: `telegram/${command.label}`,
+    tickers: command.tickers,
+    status: "received",
+    country,
+    chatId,
+    userId,
+    detail: command.label,
+  });
   for (const ticker of command.tickers) {
     if (!isValidTicker(ticker)) {
       await sendTelegram(env, chatId, `${ticker}: ${tickerValidationError(ticker)}`);
@@ -965,11 +996,39 @@ async function addLog(env, origin, action, tickers, status, detail = "", country
   ).bind(new Date().toISOString(), origin, action, tickers, status, country || "-", detail).run();
 }
 
+async function addTickerRequestLog(env, entry) {
+  if (!env.DB) return;
+  await ensureTickerRequestLogTable(env);
+  const tickers = Array.isArray(entry.tickers) ? entry.tickers.join(", ") : String(entry.tickers || "");
+  await env.DB.prepare(
+    "INSERT INTO ticker_request_logs (time, origin, source, tickers, status, country, chat_id, user_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(
+    new Date().toISOString(),
+    entry.origin || "-",
+    entry.source || "-",
+    tickers || "-",
+    entry.status || "received",
+    entry.country || "-",
+    entry.chatId || null,
+    entry.userId || null,
+    entry.detail || ""
+  ).run();
+}
+
 async function latestLogs(env) {
   if (!env.DB) return [];
   await ensureRequestLogCountryColumn(env);
   const result = await env.DB.prepare(
     "SELECT time, origin, action, tickers, status, country, detail FROM request_logs ORDER BY id DESC LIMIT 80"
+  ).all();
+  return result.results || [];
+}
+
+async function latestTickerLogs(env) {
+  if (!env.DB) return [];
+  await ensureTickerRequestLogTable(env);
+  const result = await env.DB.prepare(
+    "SELECT time, origin, source, tickers, status, country, chat_id, user_id, detail FROM ticker_request_logs ORDER BY id DESC LIMIT 80"
   ).all();
   return result.results || [];
 }
@@ -983,15 +1042,37 @@ async function ensureRequestLogCountryColumn(env) {
   }
 }
 
+async function ensureTickerRequestLogTable(env) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS ticker_request_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      time TEXT NOT NULL,
+      origin TEXT NOT NULL,
+      source TEXT NOT NULL,
+      tickers TEXT NOT NULL,
+      status TEXT NOT NULL,
+      country TEXT NOT NULL DEFAULT '-',
+      chat_id TEXT,
+      user_id TEXT,
+      detail TEXT NOT NULL DEFAULT ''
+    )`
+  ).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_ticker_request_logs_time ON ticker_request_logs(time)").run();
+}
+
 async function latestStats(env) {
-  if (!env.DB) return { logs: 0, news: 0, tickers: 0 };
-  const [logs, news, tickers] = await Promise.all([
+  if (!env.DB) return { logs: 0, tickerRequests: 0, news: 0, tickers: 0 };
+  await ensureTickerRequestLogTable(env);
+  const [logs, tickerRequests, news, tickers] = await Promise.all([
     env.DB.prepare("SELECT COUNT(*) AS count FROM request_logs").first(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM ticker_request_logs").first(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM news_items").first(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM news_tickers").first(),
   ]);
   return {
     logs: Number(logs?.count || 0),
+    tickerRequests: Number(tickerRequests?.count || 0),
     news: Number(news?.count || 0),
     tickers: Number(tickers?.count || 0),
   };
@@ -1000,6 +1081,8 @@ async function latestStats(env) {
 async function clearLogs(env) {
   if (!env.DB) return;
   await env.DB.prepare("DELETE FROM request_logs").run();
+  await ensureTickerRequestLogTable(env);
+  await env.DB.prepare("DELETE FROM ticker_request_logs").run();
 }
 
 async function ensureAccessTables(env) {
@@ -1222,6 +1305,10 @@ function telegramOrigin(message, request) {
   const user = message.from || {};
   const name = [user.first_name || chat.first_name || "", user.last_name || chat.last_name || ""].filter(Boolean).join(" ") || "-";
   return `telegram chat_id=${chat.id || "-"}; type=${chat.type || "-"}; user_id=${user.id || "-"}; username=@${user.username || chat.username || "-"}; name=${name}; lang=${user.language_code || "-"}; ip=${clientIp(request)}`;
+}
+
+function telegramUserId(message) {
+  return String(message.from?.id || "").trim();
 }
 
 function clientIp(request) {
