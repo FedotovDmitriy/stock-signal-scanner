@@ -3,15 +3,22 @@ const WORKERS = {
   prod: "https://stock-signal-scanner-production.fnemoy.workers.dev",
 };
 
-export async function onRequest(context) {
-  const { request, params } = context;
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/")) {
+      return proxyApiRequest(request, url);
+    }
+    return env.ASSETS.fetch(request);
+  },
+};
+
+async function proxyApiRequest(request, sourceUrl) {
   if (request.method === "OPTIONS") return corsResponse(null, 204);
 
-  const sourceUrl = new URL(request.url);
   const envName = String(request.headers.get("X-Monitor-Env") || sourceUrl.searchParams.get("env") || "dev").toLowerCase();
   const workerBase = WORKERS[envName] || WORKERS.dev;
-  const path = Array.isArray(params.path) ? params.path.join("/") : String(params.path || "");
-  const targetUrl = new URL(`/api/${path}`, workerBase);
+  const targetUrl = new URL(sourceUrl.pathname, workerBase);
   for (const [key, value] of sourceUrl.searchParams.entries()) {
     if (key !== "env") targetUrl.searchParams.append(key, value);
   }
