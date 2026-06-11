@@ -447,6 +447,14 @@
 
         <div class="panel">
           <div class="toolbar">
+            <strong>Technical Monitoring</strong>
+            <span class="pill" id="technicalSummary">online</span>
+          </div>
+          <div class="logs" id="technicalMonitoring"><div class="empty">No technical events yet</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
             <strong>Логи запросов</strong>
             <span class="pill" id="logCount">0 записей</span>
           </div>
@@ -608,6 +616,7 @@
       renderRequestChart(state.logs || []);
       renderTickerLogs(state.tickerLogs || []);
       renderOrchestrator(state.orchestrator || {});
+      renderTechnicalMonitoring(state.technicalMonitoring || {});
       renderLogs(state.logs || []);
     }
     function renderResultLogs(logs) {
@@ -716,6 +725,24 @@
           <td>${task.cache_hit ? "hit" : "miss"}</td>
         </tr>
       `).join("") : `<tr><td colspan="7" class="empty">No orchestrator tasks yet</td></tr>`;
+    }
+    function renderTechnicalMonitoring(monitoring) {
+      $("technicalSummary").textContent = `${monitoring.service || "offline"} · ${monitoring.avgResponseMs || 0}ms avg · ${monitoring.requestCount || 0} requests`;
+      const rows = [
+        ...(monitoring.recentErrors || []).map((item) => ({ type: "error", ...item })),
+        ...(monitoring.dataProviderErrors || []).map((item) => ({ type: "provider", ...item })),
+      ].slice(0, 10);
+      $("technicalMonitoring").innerHTML = rows.length ? rows.map((item) => `
+        <div class="log-row">
+          <span>${esc(item.updated_at || "-")}</span>
+          <div>
+            <strong>${esc(item.type)} · ${esc(item.source || "-")}</strong><br>
+            <span>Task: ${esc(item.id || "-")}</span><br>
+            <span>Tickers: ${esc(item.tickers || "-")}</span><br>
+            <span>Error: ${esc(item.error || "-")}</span>
+          </div>
+        </div>
+      `).join("") : `<div class="empty">No technical events yet</div>`;
     }
     function renderLogs(logs) {
       $("logCount").textContent = `${logs.length} записей`;

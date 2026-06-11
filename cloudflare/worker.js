@@ -2,8 +2,8 @@
 const DEFAULT_STRATEGIES = ["trend", "breakout", "volume_avwap", "momentum"];
 const MAX_TICKER_LENGTH = 12;
 const TICKER_PATTERN = /^[A-Z][A-Z0-9.\-=]{0,11}$/;
-const MARKET_CACHE_TTL_SECONDS = 60;
-const RESULT_CACHE_TTL_SECONDS = 120;
+const MARKET_CACHE_TTL_SECONDS = 15 * 60;
+const RESULT_CACHE_TTL_SECONDS = 15 * 60;
 const ORCHESTRATOR_RETRY_LIMIT = 2;
 
 const TIMEFRAMES = {
@@ -36,6 +36,7 @@ export default {
         const tickerLogs = await latestTickerLogs(env);
         const stats = await latestStats(env);
         const orchestrator = await latestOrchestratorSnapshot(env);
+        const technicalMonitoring = await latestTechnicalMonitoring(env);
         return json({
           ok: true,
           environment: env.APP_ENV || "dev",
@@ -46,6 +47,7 @@ export default {
           tickerLogs,
           stats,
           orchestrator,
+          technicalMonitoring,
         });
       }
       if (request.method === "GET" && url.pathname === "/api/admin/access-list") {
@@ -141,7 +143,7 @@ async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel 
       request: normalized,
     });
     result.origin = origin;
-    result.requestId = normalized.requestId || null;
+    result.requestId = requestKey;
     result.country = country;
     result.bot = bot;
     result.news = news;
@@ -170,7 +172,14 @@ async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel 
 
   if (delivery.async && ctx) {
     ctx.waitUntil(execute().catch((error) => addLog(env, origin, "External analysis", tickers.join(", "), "error", error.message || String(error), logCountry)));
-    return { ok: true, status: "queued", requestId: requestKey, tickers, timeframe };
+    return {
+      ok: true,
+      requestId: requestKey,
+      status: "queued",
+      items: tickers.map((ticker) => unifiedQueuedItem(ticker, "technical", requestKey)),
+      tickers,
+      timeframe,
+    };
   }
   return execute();
 }
@@ -267,6 +276,15 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
     });
     if (command.type === "fundrep") {
       const fundamentals = await fetchFundamentalData(ticker);
+      const fundItem = unifiedResultItem({
+        ticker,
+        row: result.rows[0] || null,
+        errors: result.errors || [],
+        analysisType: "fundamental",
+        requestId: result.requestId,
+        fundamentals,
+      });
+      await sendTelegram(env, chatId, fundamentalSummaryMessage(fundItem));
       const html = fundRepHtml(ticker, result, fundamentals);
       await sendTelegramDocument(env, chatId, `fundrep_${ticker}_${compactTimestamp(result.timestamp)}.html`, html, `FundRep ${ticker}: фундаментальный отчёт.`);
     } else {
@@ -329,6 +347,9 @@ async function runAnalysisOrchestrator(env, job) {
   try {
     await markAnalysisTask(env, taskId, "running", { attempts: 1, startedAt: new Date().toISOString() });
     const result = await runWithRetries(async () => analyzeTickers(tickers, config, env), ORCHESTRATOR_RETRY_LIMIT);
+    result.requestId = requestKey;
+    result.analysisType = "technical";
+    result.items = buildUnifiedItems({ tickers, result, analysisType: "technical", requestId: requestKey });
     result.orchestrator = {
       taskId,
       fingerprint,
@@ -384,6 +405,7 @@ async function analyzeTickers(tickers, config, env = {}) {
   return {
     timestamp: new Date().toISOString(),
     timeframe: config.timeframe,
+    analysisType: "technical",
     rows,
     errors,
   };
@@ -396,11 +418,19 @@ async function fetchCandles(ticker, timeframe, env = {}) {
   if (cachedCandles) return cachedCandles;
   let data = null;
   let lastError = "";
+  let providerError = "";
   for (const symbol of yahooTickerCandidates(ticker)) {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${tf.interval}&range=${tf.range}`;
-    const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    let response;
+    try {
+      response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    } catch (error) {
+      providerError = `${symbol}: Yahoo chart network error ${error.message || error}`;
+      continue;
+    }
     if (!response.ok) {
       lastError = `${symbol}: Yahoo chart HTTP ${response.status}`;
+      if (response.status === 429 || response.status >= 500) providerError = lastError;
       continue;
     }
     data = await response.json();
@@ -410,7 +440,10 @@ async function fetchCandles(ticker, timeframe, env = {}) {
   }
   const result = data?.chart?.result?.[0];
   const quote = result?.indicators?.quote?.[0];
-  if (!result || !quote || !Array.isArray(result.timestamp)) throw analysisError(lastError || "Нет рыночных данных", "NO_MARKET_DATA");
+  if (!result || !quote || !Array.isArray(result.timestamp)) {
+    if (providerError) throw analysisError(providerError, "DATA_PROVIDER_ERROR");
+    throw analysisError(lastError || "Нет рыночных данных", "NO_MARKET_DATA");
+  }
 
   const candles = [];
   for (let i = 0; i < result.timestamp.length; i += 1) {
@@ -511,6 +544,176 @@ function makeSignal(ticker, strategy, side, price, condition, idea, stop, target
   };
 }
 
+function buildUnifiedItems({ tickers, result, analysisType, requestId, fundamentalsByTicker = {} }) {
+  const rowsByTicker = new Map((result.rows || []).map((row) => [row.ticker, row]));
+  const errorsByTicker = new Map();
+  for (const error of result.errors || []) {
+    if (!errorsByTicker.has(error.ticker)) errorsByTicker.set(error.ticker, []);
+    errorsByTicker.get(error.ticker).push(error);
+  }
+  return tickers.map((ticker) => {
+    const row = rowsByTicker.get(ticker);
+    const errors = errorsByTicker.get(ticker) || [];
+    const fundamentals = fundamentalsByTicker[ticker] || null;
+    return unifiedResultItem({ ticker, row, errors, analysisType, requestId, fundamentals });
+  });
+}
+
+function unifiedResultItem({ ticker, row = null, errors = [], analysisType = "technical", requestId, fundamentals = null }) {
+  return {
+    ticker,
+    status: resultStatus(row, errors),
+    analysisType,
+    price: row ? {
+      value: row.price,
+      previousClose: row.previous_close,
+      change: row.change,
+      changePercent: row.change_percent,
+      direction: row.direction,
+    } : null,
+    indicators: row ? {
+      ema200: row.ema200,
+      mma150: row.mma150,
+      mma150DistancePercent: row.mma150_distance_percent,
+      avwap: row.avwap,
+      atr14: row.atr14,
+      poc: row.poc,
+      rsi14: row.rsi14,
+      roc20: row.roc20,
+      volume: row.volume,
+    } : {},
+    signals: row ? row.signals.map((signal) => ({
+      strategy: signal.strategy,
+      side: signal.side,
+      condition: signal.condition,
+      idea: signal.idea,
+      risk: signal.risk,
+      stop: round(signal.stop, 2),
+      target: round(signal.target, 2),
+      explanation: `${signal.condition}. ${marketContext(row)}`,
+    })) : [],
+    fundamentalSummary: fundamentals ? buildFundamentalSummary(ticker, row, fundamentals) : null,
+    dataSources: dataSourcesForItem(analysisType, fundamentals),
+    errors: errors.map((error) => ({
+      code: statusFromErrorCode(error.code),
+      message: error.error || error.message || String(error),
+    })),
+    requestId,
+  };
+}
+
+function unifiedQueuedItem(ticker, analysisType, requestId) {
+  return {
+    ticker,
+    status: "queued",
+    analysisType,
+    price: null,
+    indicators: {},
+    signals: [],
+    fundamentalSummary: null,
+    dataSources: [],
+    errors: [],
+    requestId,
+  };
+}
+
+function resultStatus(row, errors = []) {
+  if (row && errors.length) return "partial_result";
+  if (errors.some((error) => error.code === "INVALID_TICKER")) return "invalid_ticker";
+  if (errors.some((error) => error.code === "INSUFFICIENT_DATA" || error.code === "NO_MARKET_DATA")) return "not_enough_data";
+  if (errors.length) return "data_provider_error";
+  if (row?.signals?.length) return "signal_found";
+  if (row) return "no_signal";
+  return "data_provider_error";
+}
+
+function statusFromErrorCode(code) {
+  if (code === "INVALID_TICKER") return "invalid_ticker";
+  if (code === "INSUFFICIENT_DATA" || code === "NO_MARKET_DATA") return "not_enough_data";
+  if (code === "DATA_PROVIDER_ERROR") return "data_provider_error";
+  return "data_provider_error";
+}
+
+function dataSourcesForItem(analysisType, fundamentals = null) {
+  const sources = analysisType === "fundamental" ? ["Yahoo Finance quoteSummary", "Yahoo Finance quote"] : ["Yahoo Finance chart"];
+  if (fundamentals?.fundrepDataStatus) sources.push(fundamentals.fundrepDataStatus);
+  return sources;
+}
+
+function buildFundamentalSummary(ticker, row, data = {}) {
+  return {
+    valuation: {
+      trailingPE: numberOrNull(metricValue(data, "summaryDetail", "trailingPE")),
+      forwardPE: numberOrNull(metricValue(data, "summaryDetail", "forwardPE")),
+      priceToSales: numberOrNull(metricValue(data, "summaryDetail", "priceToSalesTrailing12Months")),
+      priceToBook: numberOrNull(metricValue(data, "defaultKeyStatistics", "priceToBook")),
+      marketCap: numberOrNull(metricValue(data, "price", "marketCap")),
+    },
+    growth: {
+      revenueGrowth: numberOrNull(metricValue(data, "financialData", "revenueGrowth")),
+      earningsGrowth: numberOrNull(metricValue(data, "financialData", "earningsGrowth")),
+    },
+    profitability: {
+      grossMargins: numberOrNull(metricValue(data, "financialData", "grossMargins")),
+      operatingMargins: numberOrNull(metricValue(data, "financialData", "operatingMargins")),
+      profitMargins: numberOrNull(metricValue(data, "financialData", "profitMargins")),
+      returnOnEquity: numberOrNull(metricValue(data, "financialData", "returnOnEquity")),
+      returnOnAssets: numberOrNull(metricValue(data, "financialData", "returnOnAssets")),
+    },
+    debt: {
+      totalDebt: numberOrNull(metricValue(data, "financialData", "totalDebt")),
+      totalCash: numberOrNull(metricValue(data, "financialData", "totalCash")),
+      debtToEquity: numberOrNull(metricValue(data, "financialData", "debtToEquity")),
+      currentRatio: numberOrNull(metricValue(data, "financialData", "currentRatio")),
+    },
+    momentum: row ? {
+      price: row.price,
+      changePercent: row.change_percent,
+      rsi14: row.rsi14,
+      roc20: row.roc20,
+      aboveEma200: row.ema200 == null ? null : row.price > row.ema200,
+    } : null,
+    keyRisks: fundamentalKeyRisks(row, data),
+    status: data.fundrepDataStatus || "Fundamental data summary built from available fields.",
+  };
+}
+
+function fundamentalKeyRisks(row, data = {}) {
+  const risks = [];
+  const debtToEquity = numberOrNull(metricValue(data, "financialData", "debtToEquity"));
+  const currentRatio = numberOrNull(metricValue(data, "financialData", "currentRatio"));
+  const trailingPE = numberOrNull(metricValue(data, "summaryDetail", "trailingPE"));
+  const revenueGrowth = numberOrNull(metricValue(data, "financialData", "revenueGrowth"));
+  if (debtToEquity != null && debtToEquity > 150) risks.push("Высокая долговая нагрузка относительно капитала.");
+  if (currentRatio != null && currentRatio < 1) risks.push("Текущая ликвидность ниже 1.");
+  if (trailingPE != null && trailingPE > 40) risks.push("Оценка по P/E выглядит требовательной.");
+  if (revenueGrowth != null && revenueGrowth < 0) risks.push("Выручка снижается.");
+  if (row && row.rsi14 > 70) risks.push("Технически акция может быть перегрета по RSI.");
+  if (row && row.rsi14 < 30) risks.push("Технически акция в зоне слабости по RSI.");
+  return risks.length ? risks : ["Ключевые риски требуют проверки по последней отчётности и новостям."];
+}
+
+function fundamentalSummaryMessage(item) {
+  const summary = item.fundamentalSummary || {};
+  const v = summary.valuation || {};
+  const g = summary.growth || {};
+  const p = summary.profitability || {};
+  const d = summary.debt || {};
+  const m = summary.momentum || {};
+  return [
+    `FundRep KPI summary: ${item.ticker}`,
+    `Статус: ${item.status}`,
+    `requestId: ${item.requestId || "-"}`,
+    "━━━━━━━━━━━━━━",
+    `Valuation: P/E ${fmtMetric(v.trailingPE)}, Forward P/E ${fmtMetric(v.forwardPE)}, P/S ${fmtMetric(v.priceToSales)}, P/B ${fmtMetric(v.priceToBook)}, Market Cap ${fmtMoney(v.marketCap)}`,
+    `Growth: Revenue ${fmtPercent(g.revenueGrowth)}, Earnings ${fmtPercent(g.earningsGrowth)}`,
+    `Profitability: Gross ${fmtPercent(p.grossMargins)}, Operating ${fmtPercent(p.operatingMargins)}, Net ${fmtPercent(p.profitMargins)}, ROE ${fmtPercent(p.returnOnEquity)}`,
+    `Debt: Debt ${fmtMoney(d.totalDebt)}, Cash ${fmtMoney(d.totalCash)}, D/E ${fmtMetric(d.debtToEquity)}, Current Ratio ${fmtMetric(d.currentRatio)}`,
+    `Momentum: Price ${fmtMetric(m.price)}, Change ${fmtPercent(m.changePercent)}, RSI ${fmtMetric(m.rsi14)}, ROC20 ${fmtPercent(m.roc20)}`,
+    `Key risks: ${(summary.keyRisks || []).join(" ")}`,
+  ].join("\n");
+}
+
 function analysisReportMessage(result) {
   const lines = [
     "📊 Отчёт анализа",
@@ -518,50 +721,43 @@ function analysisReportMessage(result) {
     "",
   ];
 
-  for (const row of result.rows) {
-    const arrow = row.direction === "up" ? "🟢⬆️" : row.direction === "down" ? "🔴⬇️" : "⚪➡️";
-    const movement = `${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`;
-    lines.push(`${arrow} ${row.ticker}`);
-    lines.push(`Цена: ${row.price.toFixed(2)}`);
+  for (const item of result.items || buildUnifiedItems({ tickers: [...(result.rows || []).map((row) => row.ticker), ...(result.errors || []).map((error) => error.ticker)], result, analysisType: result.analysisType || "technical", requestId: result.requestId })) {
+    const price = item.price || {};
+    const indicators = item.indicators || {};
+    const arrow = price.direction === "up" ? "🟢⬆️" : price.direction === "down" ? "🔴⬇️" : "⚪➡️";
+    const movement = price.value == null ? "-" : `${price.change > 0 ? "+" : ""}${Number(price.change || 0).toFixed(2)} (${price.changePercent > 0 ? "+" : ""}${Number(price.changePercent || 0).toFixed(2)}%)`;
+    lines.push(`${arrow} ${item.ticker}`);
+    lines.push(`Статус: ${item.status}`);
+    if (price.value != null) lines.push(`Цена: ${Number(price.value).toFixed(2)}`);
     lines.push(`Движение: ${movement}`);
-    lines.push(`EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}`);
-    lines.push(`ATR14: ${valueOrDash(row.atr14)}, MMA150: ${valueOrDash(row.mma150)}, от MMA150: ${distanceText(row.mma150_distance_percent)}`);
-    if (row.signals.length) {
+    lines.push(`EMA200: ${valueOrDash(indicators.ema200)}, AVWAP: ${valueOrDash(indicators.avwap)}, RSI: ${valueOrDash(indicators.rsi14)}`);
+    lines.push(`ATR14: ${valueOrDash(indicators.atr14)}, MMA150: ${valueOrDash(indicators.mma150)}, от MMA150: ${distanceText(indicators.mma150DistancePercent)}`);
+    if (item.signals.length) {
       lines.push("");
       lines.push("✅ Сигналы:");
-      row.signals.forEach((signal, index) => {
+      item.signals.forEach((signal, index) => {
         if (index > 0) lines.push("━━━━━━━━━━━━━━");
         const icon = signal.side === "long" ? "📈" : "📉";
         lines.push(`${icon} ${signal.side} / ${signal.strategy}`);
-        lines.push(`Почему: ${signal.condition}. ${marketContext(row)}`);
+        lines.push(`Почему: ${signal.explanation}`);
         lines.push(`Условие: ${signal.condition}`);
         lines.push(`Идея: ${signal.idea}`);
-        lines.push(`Стоп: ${signal.stop.toFixed(2)}`);
-        lines.push(`Цель: ${signal.target.toFixed(2)}`);
+        lines.push(`Стоп: ${Number(signal.stop).toFixed(2)}`);
+        lines.push(`Цель: ${Number(signal.target).toFixed(2)}`);
         lines.push(`Риск: ${signal.risk}%`);
       });
-    } else {
+    } else if (item.status === "no_signal") {
       lines.push("");
       lines.push("ℹ️ Нет сигнала:");
-      lines.push(`Условия входа не подтвердились. ${marketContext(row)}`);
+      lines.push("Условия входа не подтвердились.");
+    } else if (item.errors.length) {
+      lines.push("");
+      lines.push(item.status === "not_enough_data" ? "ℹ️ Нет данных для анализа:" : "⚠️ Ошибка:");
+      for (const error of item.errors) lines.push(`${error.code}: ${error.message}`);
     }
     lines.push("");
   }
-
-  if (result.errors.length) {
-    const insufficient = result.errors.filter((error) => error.code === "INSUFFICIENT_DATA" || error.code === "NO_MARKET_DATA");
-    const otherErrors = result.errors.filter((error) => !insufficient.includes(error));
-    if (insufficient.length) {
-      lines.push("━━━━━━━━━━━━━━");
-      lines.push("ℹ️ Нет данных для анализа:");
-      for (const error of insufficient) lines.push(`${error.ticker}: ${error.error}`);
-    }
-    if (otherErrors.length) {
-      lines.push("━━━━━━━━━━━━━━");
-      lines.push("⚠️ Ошибки:");
-      for (const error of otherErrors) lines.push(`${error.ticker}: ${error.error}`);
-    }
-  }
+  if (result.requestId) lines.push(`requestId: ${result.requestId}`);
   return lines.join("\n").trim();
 }
 
@@ -642,11 +838,10 @@ async function fetchFundamentalData(ticker) {
   const safeTicker = encodeURIComponent(ticker);
   const modules = "price,summaryDetail,defaultKeyStatistics,financialData,assetProfile";
   try {
-    const response = await fetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${safeTicker}?modules=${modules}`, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    if (!response.ok) throw new Error(`quoteSummary HTTP ${response.status}`);
-    const data = await response.json();
+    const data = await fetchJsonProviderWithRetry(
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${safeTicker}?modules=${modules}`,
+      "quoteSummary"
+    );
     const result = data?.quoteSummary?.result?.[0];
     if (result) {
       return {
@@ -657,11 +852,10 @@ async function fetchFundamentalData(ticker) {
     throw new Error("quoteSummary empty");
   } catch (error) {
     try {
-      const response = await fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${safeTicker}`, {
-        headers: { "User-Agent": "Mozilla/5.0" },
-      });
-      if (!response.ok) throw new Error(`quote HTTP ${response.status}`);
-      const data = await response.json();
+      const data = await fetchJsonProviderWithRetry(
+        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${safeTicker}`,
+        "quote"
+      );
       const quote = data?.quoteResponse?.result?.[0] || {};
       return {
         fundrepDataStatus: `quoteSummary недоступен: ${error.message || error}. Использованы доступные quote-данные.`,
@@ -1412,6 +1606,37 @@ async function latestOrchestratorSnapshot(env) {
   };
 }
 
+async function latestTechnicalMonitoring(env) {
+  if (!env.DB) {
+    return {
+      service: "online",
+      avgResponseMs: 0,
+      requestCount: 0,
+      recentErrors: [],
+      dataProviderErrors: [],
+    };
+  }
+  await ensureOrchestratorTables(env);
+  const [metrics, errors, providerErrors] = await Promise.all([
+    env.DB.prepare(
+      "SELECT COUNT(*) AS request_count, AVG(response_ms) AS avg_response_ms FROM analysis_tasks"
+    ).first(),
+    env.DB.prepare(
+      "SELECT id, source, tickers, error, updated_at FROM analysis_tasks WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 8"
+    ).all(),
+    env.DB.prepare(
+      "SELECT id, source, tickers, error, updated_at FROM analysis_tasks WHERE error LIKE '%Yahoo%' OR error LIKE '%HTTP%' ORDER BY updated_at DESC LIMIT 8"
+    ).all(),
+  ]);
+  return {
+    service: "online",
+    avgResponseMs: Math.round(Number(metrics?.avg_response_ms || 0)),
+    requestCount: Number(metrics?.request_count || 0),
+    recentErrors: errors.results || [],
+    dataProviderErrors: providerErrors.results || [],
+  };
+}
+
 async function ensureAccessTables(env) {
   if (!env.DB) return;
   await env.DB.prepare(
@@ -1569,7 +1794,9 @@ function parseTickers(value) {
 }
 
 function parseTelegramText(text) {
-  const cleaned = text.replace(/^\/start\b/i, "").replace(/^\/analyze\b/i, "").trim();
+  // Service boundary: raw valid tickers always run ordinary technical/signal analysis.
+  // Only explicit mode commands such as FundRep/PromtRep switch to a different analysis flow.
+  const cleaned = text.replace(/^\/(start|analyze|scan)\b/i, "").trim();
   return parseTickers(cleaned);
 }
 
@@ -1765,11 +1992,24 @@ async function runWithRetries(fn, retryLimit) {
       return await fn();
     } catch (error) {
       lastError = error;
+      if (error.noRetry) break;
       if (error.code === "INVALID_TICKER" || error.code === "INSUFFICIENT_DATA") break;
       if (attempt < retryLimit) await sleep(120 * (attempt + 1));
     }
   }
   throw lastError;
+}
+
+async function fetchJsonProviderWithRetry(url, providerName, retryLimit = ORCHESTRATOR_RETRY_LIMIT) {
+  return runWithRetries(async () => {
+    const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!response.ok) {
+      const error = analysisError(`${providerName} HTTP ${response.status}`, response.status === 429 || response.status >= 500 ? "DATA_PROVIDER_ERROR" : "NO_MARKET_DATA");
+      if (error.code === "NO_MARKET_DATA") error.noRetry = true;
+      throw error;
+    }
+    return response.json();
+  }, retryLimit);
 }
 
 function signalQualityScore(result) {

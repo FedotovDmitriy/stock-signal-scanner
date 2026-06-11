@@ -13,7 +13,8 @@
     "cf:d1:create:production": "wrangler d1 create stock_signal_scanner_production",
     "cf:d1:migrate:local": "wrangler d1 execute stock_signal_scanner_dev --local --file=cloudflare/schema.sql",
     "cf:d1:migrate:dev": "wrangler d1 execute stock_signal_scanner_dev --remote --file=cloudflare/schema.sql",
-    "cf:d1:migrate:production": "wrangler d1 execute stock_signal_scanner_production --remote --file=cloudflare/schema.sql"
+    "cf:d1:migrate:production": "wrangler d1 execute stock_signal_scanner_production --remote --file=cloudflare/schema.sql",
+    "test:worker-contract": "node tests/worker-contract-smoke.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
