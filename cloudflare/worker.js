@@ -2,6 +2,9 @@
 const DEFAULT_STRATEGIES = ["trend", "breakout", "volume_avwap", "momentum"];
 const MAX_TICKER_LENGTH = 12;
 const TICKER_PATTERN = /^[A-Z][A-Z0-9.\-=]{0,11}$/;
+const MARKET_CACHE_TTL_SECONDS = 60;
+const RESULT_CACHE_TTL_SECONDS = 120;
+const ORCHESTRATOR_RETRY_LIMIT = 2;
 
 const TIMEFRAMES = {
   "1m": { interval: "1m", range: "7d" },
@@ -32,6 +35,7 @@ export default {
         const logs = await latestLogs(env);
         const tickerLogs = await latestTickerLogs(env);
         const stats = await latestStats(env);
+        const orchestrator = await latestOrchestratorSnapshot(env);
         return json({
           ok: true,
           environment: env.APP_ENV || "dev",
@@ -41,6 +45,7 @@ export default {
           logs,
           tickerLogs,
           stats,
+          orchestrator,
         });
       }
       if (request.method === "GET" && url.pathname === "/api/admin/access-list") {
@@ -72,7 +77,7 @@ export default {
       if (request.method === "POST" && ["/scan", "/api/external/analyze", "/api/webhook/analyze"].includes(url.pathname)) {
         const payload = await readJson(request);
         assertWebhookToken(request, env, payload);
-        const result = await runAnalysisFromPayload(payload, env, `external ip=${clientIp(request)}`, requestCountry(request));
+        const result = await runAnalysisFromPayload(payload, env, `external ip=${clientIp(request)}`, requestCountry(request), ctx);
         return json(result);
       }
       if (request.method === "POST" && url.pathname === "/api/test-telegram") {
@@ -104,7 +109,7 @@ export default {
   },
 };
 
-async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel = "-") {
+async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel = "-", ctx = null) {
   const normalized = normalizeExternalPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
   if (!tickers.length) throw httpError("ÐŸÐµÑ€ÐµÐ´Ð°Ð¹Ñ‚Ðµ ticker Ð¸Ð»Ð¸ tickers", 400);
@@ -123,35 +128,51 @@ async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel 
     chatId,
     detail: `timeframe=${timeframe}; request=${requestKey}`,
   });
-  await addLog(env, origin, "External analysis", tickers.join(", "), "started", `timeframe=${timeframe}; request=${requestKey}`, logCountry);
-  if (env.DB) await storeMatcherPayload(env, normalized, newsId);
-  const result = await analyzeTickers(tickers, { timeframe, strategies, risk, anchorBars });
-  result.origin = origin;
-  result.requestId = normalized.requestId || null;
-  result.country = country;
-  result.bot = bot;
-  result.news = news;
 
-  if (chatId && delivery.sendToTelegram) {
-    if (news) await sendTelegram(env, chatId, newsMessage(normalized), bot);
-    await sendTelegram(env, chatId, analysisReportMessage(result), bot);
-    result.sent = [{ ticker: "ALL", strategy: "Analysis report", side: "report", destination: "telegram", chatId }];
-    result.reply = { type: "telegram", chatId, delivered: true };
-  } else {
-    result.sent = [];
-    result.reply = { type: "http", delivered: true };
+  const execute = async () => {
+    await addLog(env, origin, "External analysis", tickers.join(", "), "started", `timeframe=${timeframe}; request=${requestKey}`, logCountry);
+    if (env.DB) await storeMatcherPayload(env, normalized, newsId);
+    const result = await runAnalysisOrchestrator(env, {
+      source: normalized.source || "external",
+      origin,
+      requestKey,
+      tickers,
+      config: { timeframe, strategies, risk, anchorBars },
+      request: normalized,
+    });
+    result.origin = origin;
+    result.requestId = normalized.requestId || null;
+    result.country = country;
+    result.bot = bot;
+    result.news = news;
+
+    if (chatId && delivery.sendToTelegram) {
+      if (news) await sendTelegram(env, chatId, newsMessage(normalized), bot);
+      await sendTelegram(env, chatId, analysisReportMessage(result), bot);
+      result.sent = [{ ticker: "ALL", strategy: "Analysis report", side: "report", destination: "telegram", chatId }];
+      result.reply = { type: "telegram", chatId, delivered: true };
+    } else {
+      result.sent = [];
+      result.reply = { type: "http", delivered: true };
+    }
+
+    await addLog(
+      env,
+      origin,
+      "External analysis",
+      tickers.join(", "),
+      result.errors.length ? "partial" : "ok",
+      `errors=${result.errors.length}; signals=${countSignals(result.rows)}; task=${result.orchestrator?.taskId || "-"}`,
+      logCountry
+    );
+    return result;
+  };
+
+  if (delivery.async && ctx) {
+    ctx.waitUntil(execute().catch((error) => addLog(env, origin, "External analysis", tickers.join(", "), "error", error.message || String(error), logCountry)));
+    return { ok: true, status: "queued", requestId: requestKey, tickers, timeframe };
   }
-
-  await addLog(
-    env,
-    origin,
-    "External analysis",
-    tickers.join(", "),
-    result.errors.length ? "partial" : "ok",
-    `errors=${result.errors.length}; signals=${countSignals(result.rows)}`,
-    logCountry
-  );
-  return result;
+  return execute();
 }
 
 async function handleTelegramUpdate(update, env, request) {
@@ -192,11 +213,17 @@ async function handleTelegramUpdate(update, env, request) {
     detail: chat.title || chat.username || "",
   });
   await addLog(env, origin, "Telegram analysis", tickers.join(", "), "started", "", country);
-  const result = await analyzeTickers(tickers, {
-    timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
-    strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
-    risk: Number(env.DEFAULT_RISK || 1),
-    anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+  const result = await runAnalysisOrchestrator(env, {
+    source: "telegram",
+    origin,
+    tickers,
+    config: {
+      timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
+      strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
+      risk: Number(env.DEFAULT_RISK || 1),
+      anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+    },
+    request: { chatId, userId: telegramUserId(message), text },
   });
   await sendTelegram(env, chatId, analysisReportMessage(result));
   await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`, country);
@@ -226,11 +253,17 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
       continue;
     }
 
-    const result = await analyzeTickers([ticker], {
-      timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
-      strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
-      risk: Number(env.DEFAULT_RISK || 1),
-      anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+    const result = await runAnalysisOrchestrator(env, {
+      source: `telegram/${command.label}`,
+      origin,
+      tickers: [ticker],
+      config: {
+        timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
+        strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
+        risk: Number(env.DEFAULT_RISK || 1),
+        anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+      },
+      request: { chatId, userId, command: command.label },
     });
     if (command.type === "fundrep") {
       const fundamentals = await fetchFundamentalData(ticker);
@@ -243,21 +276,109 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
   }
 }
 
-async function analyzeTickers(tickers, config) {
+async function runAnalysisOrchestrator(env, job) {
+  const startedAt = Date.now();
+  const config = normalizeAnalysisConfig(job.config || {});
+  const tickers = [...new Set((job.tickers || []).map((ticker) => String(ticker).trim().toUpperCase()).filter(Boolean))];
+  const fingerprint = await analysisFingerprint({ tickers: [...tickers].sort(), config });
+  const requestKey = job.requestKey || crypto.randomUUID();
+  const taskId = `task_${requestKey}`;
+  const source = job.source || "unknown";
+  const origin = job.origin || "-";
+
+  await ensureOrchestratorTables(env);
+  const cached = await getAnalysisCache(env, `result:${fingerprint}`);
+  if (cached) {
+    const result = {
+      ...cached,
+      orchestrator: {
+        taskId,
+        fingerprint,
+        status: "cache_hit",
+        cacheHit: true,
+        responseMs: Date.now() - startedAt,
+      },
+    };
+    await recordAnalysisTask(env, {
+      id: taskId,
+      fingerprint,
+      source,
+      origin,
+      status: "cache_hit",
+      tickers,
+      config,
+      request: job.request || {},
+      result,
+      responseMs: result.orchestrator.responseMs,
+      cacheHit: 1,
+    });
+    return result;
+  }
+
+  await recordAnalysisTask(env, {
+    id: taskId,
+    fingerprint,
+    source,
+    origin,
+    status: "queued",
+    tickers,
+    config,
+    request: job.request || {},
+  });
+
+  try {
+    await markAnalysisTask(env, taskId, "running", { attempts: 1, startedAt: new Date().toISOString() });
+    const result = await runWithRetries(async () => analyzeTickers(tickers, config, env), ORCHESTRATOR_RETRY_LIMIT);
+    result.orchestrator = {
+      taskId,
+      fingerprint,
+      status: "completed",
+      cacheHit: false,
+      responseMs: Date.now() - startedAt,
+      signalCount: countSignals(result.rows),
+      qualityScore: signalQualityScore(result),
+    };
+    await setAnalysisCache(env, `result:${fingerprint}`, "analysis_result", result, RESULT_CACHE_TTL_SECONDS);
+    await recordAnalysisTask(env, {
+      id: taskId,
+      fingerprint,
+      source,
+      origin,
+      status: "completed",
+      tickers,
+      config,
+      request: job.request || {},
+      result,
+      responseMs: result.orchestrator.responseMs,
+      cacheHit: 0,
+    });
+    return result;
+  } catch (error) {
+    const responseMs = Date.now() - startedAt;
+    await markAnalysisTask(env, taskId, "failed", {
+      error: error.message || String(error),
+      responseMs,
+      completedAt: new Date().toISOString(),
+    });
+    throw error;
+  }
+}
+
+async function analyzeTickers(tickers, config, env = {}) {
   const rows = [];
   const errors = [];
   for (const ticker of tickers) {
     if (!isValidTicker(ticker)) {
-      errors.push({ ticker, error: tickerValidationError(ticker) });
+      errors.push({ ticker, error: tickerValidationError(ticker), code: "INVALID_TICKER" });
       continue;
     }
     try {
-      const candles = await fetchCandles(ticker, config.timeframe);
+      const candles = await runWithRetries(() => fetchCandles(ticker, config.timeframe, env), ORCHESTRATOR_RETRY_LIMIT);
       const row = analyzeTicker(ticker, candles, config);
       row.signals = row.signals.map((signal) => ({ ...signal, message: telegramSignalMessage(signal) }));
       rows.push(row);
     } catch (error) {
-      errors.push({ ticker, error: error.message || String(error) });
+      errors.push({ ticker, error: error.message || String(error), code: error.code || "ANALYSIS_ERROR" });
     }
   }
   return {
@@ -268,8 +389,11 @@ async function analyzeTickers(tickers, config) {
   };
 }
 
-async function fetchCandles(ticker, timeframe) {
+async function fetchCandles(ticker, timeframe, env = {}) {
   const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
+  const cacheKey = `market:${ticker}:${tf.interval}:${tf.range}`;
+  const cachedCandles = await getAnalysisCache(env, cacheKey);
+  if (cachedCandles) return cachedCandles;
   let data = null;
   let lastError = "";
   for (const symbol of yahooTickerCandidates(ticker)) {
@@ -286,7 +410,7 @@ async function fetchCandles(ticker, timeframe) {
   }
   const result = data?.chart?.result?.[0];
   const quote = result?.indicators?.quote?.[0];
-  if (!result || !quote || !Array.isArray(result.timestamp)) throw new Error(lastError || "Нет рыночных данных");
+  if (!result || !quote || !Array.isArray(result.timestamp)) throw analysisError(lastError || "Нет рыночных данных", "NO_MARKET_DATA");
 
   const candles = [];
   for (let i = 0; i < result.timestamp.length; i += 1) {
@@ -301,7 +425,8 @@ async function fetchCandles(ticker, timeframe) {
       volume: Number(quote.volume?.[i] ?? 0),
     });
   }
-  if (candles.length < 60) throw new Error("ÐÐµÐ´Ð¾ÑÑ‚Ð°Ñ‚Ð¾Ñ‡Ð½Ð¾ ÑÐ²ÐµÑ‡ÐµÐ¹ Ð´Ð»Ñ Ð°Ð½Ð°Ð»Ð¸Ð·Ð°");
+  if (candles.length < 60) throw analysisError("Недостаточно свечей для анализа", "INSUFFICIENT_DATA");
+  await setAnalysisCache(env, cacheKey, "market_candles", candles, MARKET_CACHE_TTL_SECONDS);
   return candles;
 }
 
@@ -408,6 +533,7 @@ function analysisReportMessage(result) {
         if (index > 0) lines.push("━━━━━━━━━━━━━━");
         const icon = signal.side === "long" ? "📈" : "📉";
         lines.push(`${icon} ${signal.side} / ${signal.strategy}`);
+        lines.push(`Почему: ${signal.condition}. ${marketContext(row)}`);
         lines.push(`Условие: ${signal.condition}`);
         lines.push(`Идея: ${signal.idea}`);
         lines.push(`Стоп: ${signal.stop.toFixed(2)}`);
@@ -416,15 +542,25 @@ function analysisReportMessage(result) {
       });
     } else {
       lines.push("");
-      lines.push("Сигналы: нет");
+      lines.push("ℹ️ Нет сигнала:");
+      lines.push(`Условия входа не подтвердились. ${marketContext(row)}`);
     }
     lines.push("");
   }
 
   if (result.errors.length) {
-    lines.push("━━━━━━━━━━━━━━");
-    lines.push("⚠️ Ошибки:");
-    for (const error of result.errors) lines.push(`${error.ticker}: ${error.error}`);
+    const insufficient = result.errors.filter((error) => error.code === "INSUFFICIENT_DATA" || error.code === "NO_MARKET_DATA");
+    const otherErrors = result.errors.filter((error) => !insufficient.includes(error));
+    if (insufficient.length) {
+      lines.push("━━━━━━━━━━━━━━");
+      lines.push("ℹ️ Нет данных для анализа:");
+      for (const error of insufficient) lines.push(`${error.ticker}: ${error.error}`);
+    }
+    if (otherErrors.length) {
+      lines.push("━━━━━━━━━━━━━━");
+      lines.push("⚠️ Ошибки:");
+      for (const error of otherErrors) lines.push(`${error.ticker}: ${error.error}`);
+    }
   }
   return lines.join("\n").trim();
 }
@@ -875,6 +1011,7 @@ function normalizeExternalPayload(payload, env) {
     delivery: {
       sendToTelegram: delivery.sendToTelegram !== false,
       messageOrder: delivery.messageOrder || "news_then_analysis",
+      async: delivery.async === true || payload.async === true,
     },
   };
 }
@@ -1062,17 +1199,22 @@ async function ensureTickerRequestLogTable(env) {
 }
 
 async function latestStats(env) {
-  if (!env.DB) return { logs: 0, tickerRequests: 0, news: 0, tickers: 0 };
+  if (!env.DB) return { logs: 0, tickerRequests: 0, analysisTasks: 0, cacheEntries: 0, news: 0, tickers: 0 };
   await ensureTickerRequestLogTable(env);
-  const [logs, tickerRequests, news, tickers] = await Promise.all([
+  await ensureOrchestratorTables(env);
+  const [logs, tickerRequests, analysisTasks, cacheEntries, news, tickers] = await Promise.all([
     env.DB.prepare("SELECT COUNT(*) AS count FROM request_logs").first(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM ticker_request_logs").first(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM analysis_tasks").first(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM analysis_cache").first(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM news_items").first(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM news_tickers").first(),
   ]);
   return {
     logs: Number(logs?.count || 0),
     tickerRequests: Number(tickerRequests?.count || 0),
+    analysisTasks: Number(analysisTasks?.count || 0),
+    cacheEntries: Number(cacheEntries?.count || 0),
     news: Number(news?.count || 0),
     tickers: Number(tickers?.count || 0),
   };
@@ -1083,6 +1225,191 @@ async function clearLogs(env) {
   await env.DB.prepare("DELETE FROM request_logs").run();
   await ensureTickerRequestLogTable(env);
   await env.DB.prepare("DELETE FROM ticker_request_logs").run();
+  await ensureOrchestratorTables(env);
+  await env.DB.prepare("DELETE FROM analysis_tasks").run();
+  await env.DB.prepare("DELETE FROM analysis_cache").run();
+}
+
+async function ensureOrchestratorTables(env) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS analysis_tasks (
+      id TEXT PRIMARY KEY,
+      fingerprint TEXT NOT NULL UNIQUE,
+      source TEXT NOT NULL,
+      origin TEXT NOT NULL,
+      status TEXT NOT NULL,
+      tickers TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      strategies TEXT NOT NULL,
+      risk REAL NOT NULL,
+      anchor_bars INTEGER NOT NULL,
+      request_json TEXT NOT NULL DEFAULT '{}',
+      result_json TEXT,
+      error TEXT NOT NULL DEFAULT '',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      response_ms INTEGER,
+      signal_count INTEGER NOT NULL DEFAULT 0,
+      quality_score REAL NOT NULL DEFAULT 0,
+      cache_hit INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT
+    )`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS analysis_cache (
+      cache_key TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`
+  ).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_analysis_tasks_created ON analysis_tasks(created_at)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_analysis_tasks_status ON analysis_tasks(status)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_analysis_cache_expires ON analysis_cache(expires_at)").run();
+}
+
+async function getAnalysisCache(env, cacheKey) {
+  if (!env.DB) return null;
+  await ensureOrchestratorTables(env);
+  const row = await env.DB.prepare(
+    "SELECT payload_json, expires_at FROM analysis_cache WHERE cache_key = ?"
+  ).bind(cacheKey).first();
+  if (!row) return null;
+  if (new Date(row.expires_at).getTime() <= Date.now()) {
+    await env.DB.prepare("DELETE FROM analysis_cache WHERE cache_key = ?").bind(cacheKey).run();
+    return null;
+  }
+  try {
+    return JSON.parse(row.payload_json);
+  } catch {
+    return null;
+  }
+}
+
+async function setAnalysisCache(env, cacheKey, kind, payload, ttlSeconds) {
+  if (!env.DB) return;
+  await ensureOrchestratorTables(env);
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO analysis_cache (cache_key, kind, payload_json, expires_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(cache_key) DO UPDATE SET kind=excluded.kind, payload_json=excluded.payload_json, expires_at=excluded.expires_at, updated_at=excluded.updated_at`
+  ).bind(cacheKey, kind, JSON.stringify(payload), expiresAt, now, now).run();
+}
+
+async function recordAnalysisTask(env, task) {
+  if (!env.DB) return;
+  await ensureOrchestratorTables(env);
+  const now = new Date().toISOString();
+  const result = task.result || null;
+  await env.DB.prepare(
+    `INSERT INTO analysis_tasks (
+      id, fingerprint, source, origin, status, tickers, timeframe, strategies, risk, anchor_bars,
+      request_json, result_json, error, attempts, response_ms, signal_count, quality_score, cache_hit,
+      created_at, updated_at, started_at, completed_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fingerprint) DO UPDATE SET
+      id=excluded.id,
+      source=excluded.source,
+      origin=excluded.origin,
+      status=excluded.status,
+      tickers=excluded.tickers,
+      timeframe=excluded.timeframe,
+      strategies=excluded.strategies,
+      risk=excluded.risk,
+      anchor_bars=excluded.anchor_bars,
+      request_json=excluded.request_json,
+      result_json=excluded.result_json,
+      error=excluded.error,
+      attempts=MAX(analysis_tasks.attempts, excluded.attempts),
+      response_ms=excluded.response_ms,
+      signal_count=excluded.signal_count,
+      quality_score=excluded.quality_score,
+      cache_hit=excluded.cache_hit,
+      updated_at=excluded.updated_at,
+      started_at=COALESCE(excluded.started_at, analysis_tasks.started_at),
+      completed_at=excluded.completed_at`
+  ).bind(
+    task.id,
+    task.fingerprint,
+    task.source,
+    task.origin,
+    task.status,
+    task.tickers.join(", "),
+    task.config.timeframe,
+    task.config.strategies.join(","),
+    task.config.risk,
+    task.config.anchorBars,
+    JSON.stringify(task.request || {}),
+    result ? JSON.stringify(result) : null,
+    task.error || "",
+    task.status === "queued" ? 0 : 1,
+    task.responseMs ?? null,
+    result ? countSignals(result.rows || []) : 0,
+    result ? signalQualityScore(result) : 0,
+    task.cacheHit ? 1 : 0,
+    now,
+    now,
+    task.status === "completed" || task.status === "cache_hit" ? now : null,
+    task.status === "completed" || task.status === "cache_hit" ? now : null
+  ).run();
+}
+
+async function markAnalysisTask(env, taskId, status, patch = {}) {
+  if (!env.DB) return;
+  await ensureOrchestratorTables(env);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE analysis_tasks
+     SET status = ?, attempts = COALESCE(?, attempts), error = COALESCE(?, error),
+         response_ms = COALESCE(?, response_ms), started_at = COALESCE(?, started_at),
+         completed_at = COALESCE(?, completed_at), updated_at = ?
+     WHERE id = ?`
+  ).bind(
+    status,
+    patch.attempts ?? null,
+    patch.error ?? null,
+    patch.responseMs ?? null,
+    patch.startedAt ?? null,
+    patch.completedAt ?? null,
+    now,
+    taskId
+  ).run();
+}
+
+async function latestOrchestratorSnapshot(env) {
+  if (!env.DB) return { tasks: [], metrics: { total: 0, cacheHits: 0, avgResponseMs: 0, errors: 0, avgQualityScore: 0 } };
+  await ensureOrchestratorTables(env);
+  const [tasks, metrics] = await Promise.all([
+    env.DB.prepare(
+      "SELECT id, source, status, tickers, timeframe, attempts, response_ms, signal_count, quality_score, cache_hit, created_at, updated_at FROM analysis_tasks ORDER BY updated_at DESC LIMIT 20"
+    ).all(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(cache_hit) AS cache_hits,
+              AVG(response_ms) AS avg_response_ms,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS errors,
+              AVG(quality_score) AS avg_quality_score
+       FROM analysis_tasks`
+    ).first(),
+  ]);
+  return {
+    tasks: tasks.results || [],
+    metrics: {
+      total: Number(metrics?.total || 0),
+      cacheHits: Number(metrics?.cache_hits || 0),
+      avgResponseMs: Math.round(Number(metrics?.avg_response_ms || 0)),
+      errors: Number(metrics?.errors || 0),
+      avgQualityScore: round(Number(metrics?.avg_quality_score || 0), 2),
+    },
+  };
 }
 
 async function ensureAccessTables(env) {
@@ -1396,9 +1723,74 @@ function valueOrDash(value) {
   return value == null || Number.isNaN(value) ? "-" : value;
 }
 
+function marketContext(row) {
+  const trend = row.ema200 == null ? "EMA200 לא זמין" : row.price > row.ema200 ? "מחיר מעל EMA200" : row.price < row.ema200 ? "מחיר מתחת EMA200" : "מחיר ליד EMA200";
+  const meanDistance = row.mma150_distance_percent == null ? "מרחק מ-MMA150 לא זמין" : `מרחק מ-MMA150: ${distanceText(row.mma150_distance_percent)}`;
+  const momentum = row.rsi14 >= 55 ? "מומנטום חיובי" : row.rsi14 <= 45 ? "מומנטום שלילי" : "מומנטום ניטרלי";
+  return `${trend}; ${meanDistance}; RSI ${valueOrDash(row.rsi14)} (${momentum}); ATR14 ${valueOrDash(row.atr14)}.`;
+}
+
 function distanceText(value) {
   if (value == null || Number.isNaN(value)) return "-";
   return `${value > 0 ? "+" : ""}${round(value, 2)}%`;
+}
+
+function normalizeAnalysisConfig(config = {}) {
+  return {
+    timeframe: config.timeframe || DEFAULT_TIMEFRAME,
+    strategies: normalizeStrategies(config.strategies || DEFAULT_STRATEGIES),
+    risk: Number(config.risk || 1),
+    anchorBars: Number(config.anchorBars || 120),
+  };
+}
+
+async function analysisFingerprint(payload) {
+  const encoded = new TextEncoder().encode(stableJson(payload));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function runWithRetries(fn, retryLimit) {
+  let lastError;
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (error.code === "INVALID_TICKER" || error.code === "INSUFFICIENT_DATA") break;
+      if (attempt < retryLimit) await sleep(120 * (attempt + 1));
+    }
+  }
+  throw lastError;
+}
+
+function signalQualityScore(result) {
+  const rows = result.rows || [];
+  const errors = result.errors || [];
+  if (!rows.length && errors.length) return 0;
+  const signalCount = countSignals(rows);
+  const rowScore = rows.length * 0.35;
+  const signalScore = Math.min(signalCount, 6) * 0.12;
+  const errorPenalty = errors.length * 0.18;
+  return Math.max(0, Math.min(1, round(rowScore + signalScore - errorPenalty, 2)));
+}
+
+function analysisError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function round(value, digits) {
