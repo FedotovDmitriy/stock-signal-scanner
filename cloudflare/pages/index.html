@@ -424,6 +424,29 @@
 
         <div class="panel">
           <div class="toolbar">
+            <strong>Analysis Orchestrator</strong>
+            <span class="pill" id="orchestratorSummary">0 tasks</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Task</th>
+                  <th>Status</th>
+                  <th>Tickers</th>
+                  <th>Latency</th>
+                  <th>Signals</th>
+                  <th>Quality</th>
+                  <th>Cache</th>
+                </tr>
+              </thead>
+              <tbody id="orchestratorRows"><tr><td colspan="7" class="empty">No orchestrator tasks yet</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
             <strong>Логи запросов</strong>
             <span class="pill" id="logCount">0 записей</span>
           </div>
@@ -584,6 +607,7 @@
       renderResultLogs(state.logs || []);
       renderRequestChart(state.logs || []);
       renderTickerLogs(state.tickerLogs || []);
+      renderOrchestrator(state.orchestrator || {});
       renderLogs(state.logs || []);
     }
     function renderResultLogs(logs) {
@@ -676,6 +700,22 @@
           <td><span class="${log.status === "received" || log.status === "ok" ? "long" : log.status === "error" ? "short" : "none"}">${esc(log.status || "-")}</span></td>
         </tr>
       `).join("") : `<tr><td colspan="7" class="empty">Пока тикеров нет</td></tr>`;
+    }
+    function renderOrchestrator(orchestrator) {
+      const metrics = orchestrator.metrics || {};
+      const tasks = orchestrator.tasks || [];
+      $("orchestratorSummary").textContent = `${metrics.total || 0} tasks · ${metrics.avgResponseMs || 0}ms avg · ${metrics.errors || 0} errors · q ${metrics.avgQualityScore || 0}`;
+      $("orchestratorRows").innerHTML = tasks.length ? tasks.map((task) => `
+        <tr>
+          <td>${esc(task.id || "-")}</td>
+          <td><span class="${task.status === "completed" || task.status === "cache_hit" ? "long" : task.status === "failed" ? "short" : "none"}">${esc(task.status || "-")}</span></td>
+          <td class="ticker">${esc(task.tickers || "-")}</td>
+          <td>${esc(task.response_ms ?? "-")} ms</td>
+          <td>${esc(task.signal_count ?? 0)}</td>
+          <td>${esc(task.quality_score ?? 0)}</td>
+          <td>${task.cache_hit ? "hit" : "miss"}</td>
+        </tr>
+      `).join("") : `<tr><td colspan="7" class="empty">No orchestrator tasks yet</td></tr>`;
     }
     function renderLogs(logs) {
       $("logCount").textContent = `${logs.length} записей`;
