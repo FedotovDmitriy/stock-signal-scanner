@@ -4,6 +4,27 @@ This document defines how `telegram_company_matcher_app` should send news, count
 
 Stock Signal Scanner is the backend that receives tickers, runs technical analysis, sends Telegram messages, and returns a JSON result.
 
+## Service Boundary
+
+The default service mode is standard technical/signal analysis.
+
+Do not send a command for ordinary ticker analysis:
+
+```text
+AAPL
+AAPL, MSFT, NVDA
+```
+
+Both examples run ordinary technical/signal analysis. A special command is required only to select a different mode:
+
+```text
+FundRep AAPL
+FundRep AAPL, MSFT
+PromtRep AAPL
+```
+
+For API integrations, send raw ticker symbols in `ticker` or `tickers`. Do not wrap ordinary analysis in a command string. `FundRep` and `PromtRep` are Telegram command modes, not the default API format.
+
 ## Environments
 
 ### Dev
@@ -72,6 +93,69 @@ Use this format when there is no news context and only ticker analysis is needed
   "source": "telegram_company_matcher_app"
 }
 ```
+
+## Unified Response Format
+
+Every accepted analysis request returns a `requestId`. If the caller did not provide one, Stock Signal Scanner generates it.
+
+The canonical result list is `items`. Each item has the same structure for API responses and Telegram-rendered reports:
+
+```json
+{
+  "requestId": "generated-or-client-request-id",
+  "items": [
+    {
+      "ticker": "AAPL",
+      "status": "signal_found",
+      "analysisType": "technical",
+      "price": {
+        "value": 210.25,
+        "previousClose": 208.1,
+        "change": 2.15,
+        "changePercent": 1.03,
+        "direction": "up"
+      },
+      "indicators": {
+        "ema200": 190.4,
+        "mma150": 195.2,
+        "mma150DistancePercent": 7.71,
+        "avwap": 201.3,
+        "atr14": 4.2,
+        "poc": 205.5,
+        "rsi14": 58.4,
+        "roc20": 6.2,
+        "volume": 1234567
+      },
+      "signals": [
+        {
+          "strategy": "Trend Following",
+          "side": "long",
+          "condition": "price above EMA200 and AVWAP",
+          "idea": "possible long",
+          "risk": 1,
+          "stop": 201.85,
+          "target": 222.85,
+          "explanation": "Why this signal was generated."
+        }
+      ],
+      "fundamentalSummary": null,
+      "dataSources": ["Yahoo Finance chart"],
+      "errors": []
+    }
+  ]
+}
+```
+
+Possible item statuses:
+
+- `signal_found`
+- `no_signal`
+- `not_enough_data`
+- `invalid_ticker`
+- `data_provider_error`
+- `partial_result`
+
+Legacy fields such as `rows` and `errors` may still be present for compatibility, but new integrations should read `items`.
 
 ## Full Recommended Request
 
