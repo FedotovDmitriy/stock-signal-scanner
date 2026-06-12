@@ -211,6 +211,7 @@ async function handleTelegramUpdate(update, env, request) {
     return;
   }
 
+  const requestId = crypto.randomUUID();
   await addTickerRequestLog(env, {
     origin,
     source: "telegram",
@@ -219,12 +220,13 @@ async function handleTelegramUpdate(update, env, request) {
     country,
     chatId,
     userId: telegramUserId(message),
-    detail: chat.title || chat.username || "",
+    detail: `requestId=${requestId}; ${chat.title || chat.username || ""}`.trim(),
   });
-  await addLog(env, origin, "Telegram analysis", tickers.join(", "), "started", "", country);
+  await addLog(env, origin, "Telegram analysis", tickers.join(", "), "started", `requestId=${requestId}`, country);
   const result = await runAnalysisOrchestrator(env, {
     source: "telegram",
     origin,
+    requestKey: requestId,
     tickers,
     config: {
       timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
@@ -235,7 +237,7 @@ async function handleTelegramUpdate(update, env, request) {
     request: { chatId, userId: telegramUserId(message), text },
   });
   await sendTelegram(env, chatId, analysisReportMessage(result));
-  await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`, country);
+  await addLog(env, origin, "Telegram analysis", tickers.join(", "), result.errors.length ? "partial" : "ok", `requestId=${requestId}; errors=${result.errors.length}`, country);
 }
 
 async function handleTelegramReportCommand(command, env, chatId, origin, country = "-", userId = "") {
@@ -244,7 +246,8 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
     return;
   }
 
-  await addLog(env, origin, command.label, command.tickers.join(", "), "started", "", country);
+  const requestId = crypto.randomUUID();
+  await addLog(env, origin, command.label, command.tickers.join(", "), "started", `requestId=${requestId}`, country);
   await addTickerRequestLog(env, {
     origin,
     source: `telegram/${command.label}`,
@@ -253,18 +256,19 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
     country,
     chatId,
     userId,
-    detail: command.label,
+    detail: `requestId=${requestId}; ${command.label}`,
   });
   for (const ticker of command.tickers) {
     if (!isValidTicker(ticker)) {
       await sendTelegram(env, chatId, `${ticker}: ${tickerValidationError(ticker)}`);
-      await addLog(env, origin, command.label, ticker, "error", tickerValidationError(ticker), country);
+      await addLog(env, origin, command.label, ticker, "error", `requestId=${requestId}; ${tickerValidationError(ticker)}`, country);
       continue;
     }
 
     const result = await runAnalysisOrchestrator(env, {
       source: `telegram/${command.label}`,
       origin,
+      requestKey: `${requestId}-${ticker}`,
       tickers: [ticker],
       config: {
         timeframe: env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME,
@@ -290,7 +294,7 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
     } else {
       await sendTelegram(env, chatId, promtRepMessage(ticker, result));
     }
-    await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `errors=${result.errors.length}`, country);
+    await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `requestId=${requestId}; taskRequestId=${result.requestId}; errors=${result.errors.length}`, country);
   }
 }
 

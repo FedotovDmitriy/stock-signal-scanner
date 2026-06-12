@@ -52,6 +52,7 @@ try {
   await testNoDataTicker();
   await testProviderError();
   await testMultipleTickers();
+  await testTelegramTickerRouting();
   await testPartialFundamentalResult();
   console.log("worker contract smoke tests ok");
 } finally {
@@ -90,6 +91,29 @@ async function testMultipleTickers() {
   const result = await postScan({ tickers: "AAPL, MSFT" });
   assert(result.items?.length === 2, "multiple tickers return two items");
   assert(result.items.map((item) => item.ticker).join(",") === "AAPL,MSFT", "multiple ticker order");
+}
+
+async function testTelegramTickerRouting() {
+  mode = "ok";
+  telegramMessages = [];
+  const update = {
+    message: {
+      text: "AAPL",
+      chat: { id: 123, type: "private" },
+      from: { id: 456, username: "tester" },
+    },
+  };
+  const waits = [];
+  const response = await worker.fetch(new Request("https://local.test/telegram/webhook", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  }), DEFAULT_ENV, { waitUntil: (promise) => waits.push(promise) });
+  await Promise.all(waits);
+  assert((await response.json()).ok === true, "telegram ticker webhook accepted");
+  const text = telegramMessages[0]?.text || "";
+  assert(text.includes("AAPL"), "telegram ticker report includes ticker");
+  assert(text.includes("requestId:"), "telegram ticker report includes requestId");
 }
 
 async function testPartialFundamentalResult() {
