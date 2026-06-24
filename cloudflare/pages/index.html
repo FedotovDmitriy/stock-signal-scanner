@@ -941,10 +941,8 @@
     $("clearLogsBtn").addEventListener("click", async () => {
       setBusy(true);
       try {
-        await api("/api/clear-logs", {
+        await adminApi("/api/clear-logs", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: currentEnv().apiToken }),
         });
         await refresh();
         $("toast").textContent = "Логи очищены";

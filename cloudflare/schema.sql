@@ -302,11 +302,21 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS contract_results (
+  request_id TEXT PRIMARY KEY,
+  contract_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(time);
 CREATE INDEX IF NOT EXISTS idx_ticker_request_logs_time ON ticker_request_logs(time);
 CREATE INDEX IF NOT EXISTS idx_analysis_tasks_created ON analysis_tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_analysis_tasks_status ON analysis_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_analysis_cache_expires ON analysis_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_contract_results_status ON contract_results(status);
 CREATE INDEX IF NOT EXISTS idx_allowed_users_enabled ON allowed_users(enabled);
 CREATE INDEX IF NOT EXISTS idx_allowed_chats_enabled ON allowed_chats(enabled);
 CREATE INDEX IF NOT EXISTS idx_users_telegram_user_id ON users(telegram_user_id);

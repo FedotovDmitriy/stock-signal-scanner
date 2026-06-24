@@ -840,6 +840,7 @@ function analysisReportMessage(result) {
     }
     lines.push("");
   }
+  if (result.requestId) lines.push(`requestId: ${result.requestId}`);
   return lines.join("\n").trim();
 }
 
@@ -2248,9 +2249,9 @@ function valueOrDash(value) {
 }
 
 function marketContext(row) {
-  const trend = row.ema200 == null ? "EMA200 недоступна" : row.price > row.ema200 ? "цена выше EMA200" : row.price < row.ema200 ? "цена ниже EMA200" : "цена около EMA200";
-  const meanDistance = row.mma150_distance_percent == null ? "расстояние от MMA150 недоступно" : `расстояние от MMA150: ${distanceText(row.mma150_distance_percent)}`;
-  const momentum = row.rsi14 >= 55 ? "положительный momentum" : row.rsi14 <= 45 ? "отрицательный momentum" : "нейтральный momentum";
+  const trend = row.ema200 == null ? "EMA200 לא זמין" : row.price > row.ema200 ? "מחיר מעל EMA200" : row.price < row.ema200 ? "מחיר מתחת EMA200" : "מחיר ליד EMA200";
+  const meanDistance = row.mma150_distance_percent == null ? "מרחק מ-MMA150 לא זמין" : `מרחק מ-MMA150: ${distanceText(row.mma150_distance_percent)}`;
+  const momentum = row.rsi14 >= 55 ? "מומנטום חיובי" : row.rsi14 <= 45 ? "מומנטום שלילי" : "מומנטום ניטרלי";
   return `${trend}; ${meanDistance}; RSI ${valueOrDash(row.rsi14)} (${momentum}); ATR14 ${valueOrDash(row.atr14)}.`;
 }
 

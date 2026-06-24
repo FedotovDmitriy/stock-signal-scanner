@@ -90,8 +90,11 @@ You can add secrets from the Cloudflare dashboard UI:
 
 Required secrets:
 
-- `WEBHOOK_TOKEN` - token used by the Pages monitor and `telegram_company_matcher_app`.
+- `SERVICE_TOKEN` - preferred service token for `POST /api/external/analyze`.
+- `WEBHOOK_TOKEN` - legacy scanner token and fallback service token.
+- `TELEGRAM_WEBHOOK_SECRET` - secret checked against Telegram `X-Telegram-Bot-Api-Secret-Token`.
 - `TELEGRAM_BOT_TOKEN` - default Telegram bot token.
+- `ADMIN_TOKEN` - admin token for monitoring/admin actions such as log cleanup.
 - `TELEGRAM_CHAT_ID` - optional default chat for tests and fallback delivery.
 
 Optional per-bot secrets:
@@ -106,7 +109,10 @@ For dev environment:
 ```powershell
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
+npx wrangler secret put SERVICE_TOKEN
 npx wrangler secret put WEBHOOK_TOKEN
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+npx wrangler secret put ADMIN_TOKEN
 ```
 
 For production environment:
@@ -114,7 +120,10 @@ For production environment:
 ```powershell
 npx wrangler secret put TELEGRAM_BOT_TOKEN --env production
 npx wrangler secret put TELEGRAM_CHAT_ID --env production
+npx wrangler secret put SERVICE_TOKEN --env production
 npx wrangler secret put WEBHOOK_TOKEN --env production
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET --env production
+npx wrangler secret put ADMIN_TOKEN --env production
 ```
 
 Use different bot tokens and webhook tokens for dev and production.
@@ -182,7 +191,11 @@ Dev bot:
 ```powershell
 $botToken = "DEV_TELEGRAM_BOT_TOKEN"
 $workerUrl = "https://stock-signal-scanner-dev.USERNAME.workers.dev"
-Invoke-RestMethod "https://api.telegram.org/bot$botToken/setWebhook?url=$workerUrl/telegram/webhook"
+$telegramWebhookSecret = "DEV_TELEGRAM_WEBHOOK_SECRET"
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "https://api.telegram.org/bot$botToken/setWebhook" `
+  -Body @{ url = "$workerUrl/telegram/webhook"; secret_token = $telegramWebhookSecret }
 ```
 
 Production bot:
@@ -190,7 +203,11 @@ Production bot:
 ```powershell
 $botToken = "PRODUCTION_TELEGRAM_BOT_TOKEN"
 $workerUrl = "https://stock-signal-scanner-production.USERNAME.workers.dev"
-Invoke-RestMethod "https://api.telegram.org/bot$botToken/setWebhook?url=$workerUrl/telegram/webhook"
+$telegramWebhookSecret = "PRODUCTION_TELEGRAM_WEBHOOK_SECRET"
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "https://api.telegram.org/bot$botToken/setWebhook" `
+  -Body @{ url = "$workerUrl/telegram/webhook"; secret_token = $telegramWebhookSecret }
 ```
 
 Check webhook:
