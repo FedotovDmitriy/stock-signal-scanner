@@ -92,6 +92,11 @@ Required secrets:
 
 - `SERVICE_TOKEN` - preferred service token for `POST /api/external/analyze`.
 - `WEBHOOK_TOKEN` - legacy scanner token and fallback service token.
+- `INTERNAL_API_SECRET` - internal service secret used by scanner when calling `market-signal-ai-bot`.
+- `ACCESS_CHECK_URL` - full internal quota/access endpoint URL, for example `https://market-signal-ai-bot.example.workers.dev/api/internal/access/check`.
+- `MARKET_SIGNAL_AI_BOT_URL` - optional base URL alternative; if `ACCESS_CHECK_URL` is missing, scanner calls `<MARKET_SIGNAL_AI_BOT_URL>/api/internal/access/check`.
+- `REPORT_GENERATION_VERSION` - optional report cache generation version; defaults to `1`. Change it when report-generation logic changes and old cached reports must not be reused.
+- `DEFAULT_LANGUAGE` - optional language for direct Telegram commands; supports `ru`, `en`, and `he`, and defaults to `ru`. Contract requests use their upstream `language` value.
 - `TELEGRAM_WEBHOOK_SECRET` - secret checked against Telegram `X-Telegram-Bot-Api-Secret-Token`.
 - `TELEGRAM_BOT_TOKEN` - default Telegram bot token.
 - `ADMIN_TOKEN` - admin token for monitoring/admin actions such as log cleanup.
@@ -111,9 +116,12 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler secret put SERVICE_TOKEN
 npx wrangler secret put WEBHOOK_TOKEN
+npx wrangler secret put INTERNAL_API_SECRET
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 npx wrangler secret put ADMIN_TOKEN
 ```
+
+Add `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` as an environment variable in Cloudflare. For local-only testing you may set `BYPASS_QUOTA_CHECK=true`; do not enable quota bypass in production.
 
 For production environment:
 
@@ -122,9 +130,20 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN --env production
 npx wrangler secret put TELEGRAM_CHAT_ID --env production
 npx wrangler secret put SERVICE_TOKEN --env production
 npx wrangler secret put WEBHOOK_TOKEN --env production
+npx wrangler secret put INTERNAL_API_SECRET --env production
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET --env production
 npx wrangler secret put ADMIN_TOKEN --env production
 ```
+
+Production must have `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` configured. If the access check is unavailable or not configured, `POST /api/external/analyze` fails closed and does not run market-data analysis.
+
+Regular technical reports and structured FundRep reports are cached in `analysis_cache` for 60 minutes. Cache keys isolate ticker, report type, language, and generation version. When the access service returns `reportSource=cached_report`, scanner returns only the matching scanner-owned report and makes no Yahoo or Telegram call until delivery begins. Missing or expired regular cache returns `cached_report_not_found`; missing or expired FundRep cache returns `fundrep_cache_not_found`. Both fail closed with HTTP 503 and never start a new paid analysis silently.
+
+`POST /api/external/analyze` with `reportType=fundrep` returns structured JSON with `analysisType=fundamental`, localized KPI summaries, risks, data sources, and `cacheStatus`. Supported cache statuses are `hit`, `miss`, `refreshed`, and `mixed`. `forceRefresh=true` bypasses scanner result and market-data caches, rebuilds FundRep, and replaces its cache entry. A contradictory access decision combining force refresh with `reportSource=cached_report` returns HTTP 503 with `invalid_access_decision`.
+
+Supported contract languages are `ru`, `en`, and `he`. Regional and legacy aliases are normalized: `ru-RU` to `ru`, `en-US` to `en`, and `he-IL` or `iw` to `he`. If `language` is absent, contract `1.0` temporarily defaults to `ru` for backward compatibility. An unsupported value such as `pl` returns HTTP 400 with `status=rejected`, `field=language`, and `code=unsupported_language` before access, market-data, or Telegram calls.
+
+Technical Telegram reports, signal explanations, market context, news labels, FundRep HTML, KPI summaries, and PromtRep prompts use one selected language per report. International ticker symbols and indicator names such as EMA200, RSI, AVWAP, and CAPE are not translated. Internal `requestId` values remain in API responses and logs but are not shown in user-facing messages.
 
 Use different bot tokens and webhook tokens for dev and production.
 
@@ -261,7 +280,7 @@ One-request overrides:
 
 ## First-stage limitations
 
-- `FundRep` PDF and `PromtRep` PDF are not yet moved to Workers.
+- FundRep PDF rendering is not implemented. The API returns structured JSON; localized FundRep HTML is created only as a Telegram document artifact.
 - Fundamental providers FMP/Polygon/Finnhub are not yet moved to Workers.
 
 Next stages:
