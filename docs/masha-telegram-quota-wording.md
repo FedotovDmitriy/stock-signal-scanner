@@ -57,6 +57,34 @@ This table is for implementation only. Values in the left column must never be s
 | `rejected_no_access` | `analysis.access.not_in_plan` |
 | `failed_quota_service` | `analysis.access.temporarily_unavailable` |
 
+## Confirmed Access Messages
+
+Access denied uses the existing key `analysis.access.not_in_plan`:
+
+```text
+RU: Этот тип анализа недоступен в вашем тарифе.
+EN: This analysis type is not available on your plan.
+```
+
+Temporarily unavailable uses the existing key `analysis.access.temporarily_unavailable`:
+
+```text
+RU: Сейчас не удалось проверить доступ к анализу. Попробуйте ещё раз чуть позже.
+EN: We could not verify access right now. Please try again shortly.
+```
+
+Security and infrastructure failures must not create additional user-facing variants:
+
+| Internal outcome | User-facing key |
+| --- | --- |
+| Access or plan denied | `analysis.access.not_in_plan` |
+| HMAC or signature validation failure | `analysis.access.temporarily_unavailable` |
+| Repeated, expired, or invalid nonce | `analysis.access.temporarily_unavailable` |
+| Core timeout, invalid response, or unavailable service | `analysis.access.temporarily_unavailable` |
+| Unknown internal error while checking access | `analysis.access.temporarily_unavailable` |
+
+The internal outcome column is implementation guidance only and must never be rendered in Telegram.
+
 ## Unit Formatting
 
 The application formats the number before inserting `{units}` or `{remaining_units}`.
@@ -103,6 +131,12 @@ reason
 requestId
 contractVersion
 allowed
+HMAC
+signature
+nonce
+Core
+stack trace
+internal error code
 ```
 
 Implementation requirements:
@@ -112,6 +146,7 @@ Implementation requirements:
 3. Format numeric values through the locale-aware unit formatter.
 4. If a decision is unknown, show `analysis.access.temporarily_unavailable` and log the technical value privately.
 5. Do not fall back to another language inside the same message.
+6. Do not mention authentication, signatures, nonce validation, Core, service topology, or internal errors.
 
 ## Recommended Presentation
 
@@ -121,4 +156,3 @@ Implementation requirements:
 - For a discounted report, explain the discount without exposing its technical source.
 - For rejected requests, show no partial report.
 - Keep support destination and tariff actions inside `market-signal-ai-bot`.
-

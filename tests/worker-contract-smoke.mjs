@@ -2,6 +2,19 @@ import assert from "node:assert/strict";
 import worker from "../cloudflare/worker.js";
 
 const originalFetch = globalThis.fetch;
+const CORE_HMAC_KEY_ID = "scanner-test-v1";
+const CORE_HMAC_SECRET = "scanner-test-hmac-secret-32-bytes-minimum";
+
+async function testSha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function testHmacHex(secret, value) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function candlesPayload(symbol = "AAPL") {
   const now = Math.floor(Date.now() / 1000);
@@ -73,14 +86,14 @@ function validPayload(overrides = {}) {
 }
 
 const accessEnv = {
-  BYPASS_QUOTA_CHECK: "false",
   ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-  INTERNAL_API_SECRET: "internal-secret",
+  CORE_HMAC_KEY_ID,
+  CORE_HMAC_SECRET,
 };
 
 function allowedAccessDecision(overrides = {}) {
   return {
-    contractVersion: "1.0",
+    contractVersion: "1.1",
     allowed: true,
     chargeUnits: 3,
     quotaDecision: "new_fundrep",
@@ -102,7 +115,7 @@ async function postAnalyze(payload, envOverrides = {}) {
     body: JSON.stringify(payload),
   }), {
     APP_ENV: "dev",
-    BYPASS_QUOTA_CHECK: "true",
+    ...accessEnv,
     WEBHOOK_TOKEN: "test-token",
     ADMIN_TOKEN: "admin-token",
     TELEGRAM_WEBHOOK_SECRET: "telegram-secret",
@@ -121,7 +134,7 @@ async function postAnalyzeWithHeaders(payload, headers = {}) {
     body: JSON.stringify(payload),
   }), {
     APP_ENV: "dev",
-    BYPASS_QUOTA_CHECK: "true",
+    ...accessEnv,
     WEBHOOK_TOKEN: "test-token",
     ADMIN_TOKEN: "admin-token",
     TELEGRAM_WEBHOOK_SECRET: "telegram-secret",
@@ -135,19 +148,66 @@ async function withMockFetch(testFn, options = {}) {
   let fundamentalCalls = 0;
   let telegramCalls = 0;
   let accessCalls = 0;
+  let commitCalls = 0;
+  let hmacValid = true;
+  const accessRequests = [];
+  const commitRequests = [];
+  const transportRequestIds = new Set();
+  const authorizationHeaders = [];
+  const callOrder = [];
   const telegramMessages = [];
+  const businessDecisions = new Map();
+  const committedReceipts = new Map();
+
+  async function verifyCoreHmac(init, pathname) {
+    const rawBody = String(init.body || "");
+    const headers = new Headers(init.headers || {});
+    const keyId = headers.get("X-Key-Id") || "";
+    const transportRequestId = headers.get("X-Request-Id") || "";
+    const timestamp = headers.get("X-Timestamp") || "";
+    const signature = (headers.get("X-Signature") || "").replace(/^sha256=/, "");
+    const bodyHash = await testSha256Hex(rawBody);
+    const expected = await testHmacHex(options.coreExpectedSecret || CORE_HMAC_SECRET, `${timestamp}.${keyId}.${transportRequestId}.POST.${pathname}..${bodyHash}`);
+    const valid = keyId === CORE_HMAC_KEY_ID && Boolean(transportRequestId) && signature === expected;
+    hmacValid = hmacValid && valid;
+    authorizationHeaders.push(headers.get("Authorization"));
+    if (!valid || transportRequestIds.has(transportRequestId)) {
+      return { error: Response.json({ error: "unauthorized" }, { status: transportRequestIds.has(transportRequestId) ? 409 : 401 }) };
+    }
+    transportRequestIds.add(transportRequestId);
+    return { rawBody, transportRequestId };
+  }
+
   globalThis.fetch = async (url, init = {}) => {
     const href = String(url);
     if (href === "https://bot.test/api/internal/access/check") {
       accessCalls += 1;
+      callOrder.push("core");
       if (options.accessThrows) throw new Error("quota service unavailable");
+      const verified = await verifyCoreHmac(init, "/api/internal/access/check");
+      if (verified.error) return verified.error;
       if (options.accessStatus && options.accessStatus !== 200) {
         return Response.json(options.accessBody || { error: "quota service unavailable" }, { status: options.accessStatus });
       }
-      const request = JSON.parse(String(init.body || "{}"));
+      const request = JSON.parse(verified.rawBody || "{}");
+      accessRequests.push(request);
+      const businessKey = `${request.requestId}:${request.ticker}`;
+      const requestHash = JSON.stringify(request);
+      const previous = businessDecisions.get(businessKey);
+      if (previous) {
+        if (previous.requestHash !== requestHash) {
+          return Response.json({ contractVersion: "1.1", requestId: request.requestId, allowed: false, reason: "invalid_request" }, { status: 400 });
+        }
+        return Response.json({
+          ...previous.decision,
+          chargeUnits: 0,
+          quotaDecision: request.reportType === "fundrep" ? "own_repeat_fundrep" : "own_repeat",
+          reportSource: "own_repeat",
+        });
+      }
       const accessBody = typeof options.accessBody === "function" ? options.accessBody(request) : options.accessBody;
-      return Response.json(accessBody || {
-        contractVersion: "1.0",
+      const decision = {
+        contractVersion: "1.1",
         requestId: request.requestId,
         allowed: true,
         chargeUnits: 1,
@@ -156,11 +216,43 @@ async function withMockFetch(testFn, options = {}) {
         reportSource: "new_analysis",
         remainingUnits: 10,
         reason: "Allowed",
-      });
+        cacheReceiptId: `receipt-${request.ticker}-${accessCalls}`,
+        ...(accessBody || {}),
+      };
+      if (!/^(new|refresh)_(regular|fundrep)$/.test(decision.quotaDecision)) decision.cacheReceiptId = null;
+      businessDecisions.set(businessKey, { requestHash, decision });
+      return Response.json(decision);
+    }
+    if (href === "https://bot.test/api/internal/access/cache/commit") {
+      commitCalls += 1;
+      callOrder.push("commit");
+      const verified = await verifyCoreHmac(init, "/api/internal/access/cache/commit");
+      if (verified.error) return verified.error;
+      const request = JSON.parse(verified.rawBody || "{}");
+      commitRequests.push(request);
+      const configuredStatus = Array.isArray(options.commitStatuses)
+        ? options.commitStatuses[Math.min(commitCalls - 1, options.commitStatuses.length - 1)]
+        : options.commitStatus;
+      if (configuredStatus && configuredStatus !== 200) {
+        return Response.json({ error: options.commitError || "cache_commit_failed" }, { status: configuredStatus });
+      }
+      const previous = committedReceipts.get(request.cacheReceiptId);
+      if (previous && previous.resultDigest !== request.resultDigest) {
+        return Response.json({ error: "cache_receipt_already_used" }, { status: 409 });
+      }
+      const committed = previous || {
+        ...request,
+        cacheEntryId: `entry-${request.cacheReceiptId}`,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      };
+      committedReceipts.set(request.cacheReceiptId, committed);
+      if (options.dropFirstCommitResponse && commitCalls === 1) throw new Error("response lost after commit");
+      return Response.json({ contractVersion: "1.1", cacheEntryId: committed.cacheEntryId, committed: true, expiresAt: committed.expiresAt });
     }
     if (href.includes("/v10/finance/quoteSummary/")) {
       yahooCalls += 1;
       fundamentalCalls += 1;
+      callOrder.push("provider");
       if (options.fundamentalStatus) return Response.json({ error: "fundamental provider unavailable" }, { status: options.fundamentalStatus });
       if (options.fundamentalEmpty) return Response.json({ quoteSummary: { result: [], error: null } });
       const symbol = decodeURIComponent(href.split("/quoteSummary/")[1].split("?")[0]);
@@ -169,12 +261,14 @@ async function withMockFetch(testFn, options = {}) {
     if (href.includes("/v7/finance/quote")) {
       yahooCalls += 1;
       fundamentalCalls += 1;
+      callOrder.push("provider");
       if (options.fundamentalStatus) return Response.json({ error: "fundamental provider unavailable" }, { status: options.fundamentalStatus });
       return Response.json({ quoteResponse: { result: [] } });
     }
     if (href.includes("query1.finance.yahoo.com")) {
       yahooCalls += 1;
       chartCalls += 1;
+      callOrder.push("provider");
       if (options.yahooStatus) {
         return Response.json({ error: "provider unavailable" }, { status: options.yahooStatus });
       }
@@ -189,6 +283,7 @@ async function withMockFetch(testFn, options = {}) {
     }
     if (href.includes("api.telegram.org")) {
       telegramCalls += 1;
+      callOrder.push("telegram");
       if (typeof FormData !== "undefined" && init.body instanceof FormData) {
         telegramMessages.push({ caption: String(init.body.get("caption") || ""), document: true });
       } else try {
@@ -207,6 +302,13 @@ async function withMockFetch(testFn, options = {}) {
       get fundamentalCalls() { return fundamentalCalls; },
       get telegramCalls() { return telegramCalls; },
       get accessCalls() { return accessCalls; },
+      get commitCalls() { return commitCalls; },
+      get hmacValid() { return hmacValid; },
+      accessRequests,
+      commitRequests,
+      transportRequestIds,
+      authorizationHeaders,
+      callOrder,
       telegramMessages,
     });
   } finally {
@@ -232,9 +334,8 @@ async function testValidContractPayload() {
 async function testAccessCheckAllowsAnalysis() {
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(validPayload({ tickers: ["ACCS"], language: "ru", userId: "user-1", chatId: "chat-1" }), {
-      BYPASS_QUOTA_CHECK: "false",
       ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-      INTERNAL_API_SECRET: "internal-secret",
+      CORE_HMAC_SECRET,
     });
     assert.equal(response.status, 200);
     const body = await response.json();
@@ -246,12 +347,156 @@ async function testAccessCheckAllowsAnalysis() {
   });
 }
 
+async function testCoreHmacRequestContract() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["HMA1", "HMA2"], userId: "hmac-user" }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.hmacValid, true);
+    assert.equal(calls.authorizationHeaders.every((value) => value == null), true);
+    assert.equal(calls.transportRequestIds.size, 4);
+    assert.equal(calls.accessRequests.length, 2);
+    assert.equal(calls.commitRequests.length, 2);
+    assert.equal(calls.accessRequests.every((request) => request.contractVersion === "1.1"), true);
+    assert.equal(calls.accessRequests.every((request) => request.cacheStatus === "miss" && request.cacheCreatedAt === null && request.cacheGenerationVersion === null), true);
+    assert.equal(calls.callOrder[0], "core");
+    assert.ok(calls.callOrder.indexOf("provider") > calls.callOrder.lastIndexOf("core"));
+  });
+}
+
+async function testCacheCommitFlowAndDigest() {
+  await withMockFetch(async (calls) => {
+    const requestId = `commit-${crypto.randomUUID()}`;
+    const response = await postAnalyze(validPayload({ requestId, tickers: ["CMIT"], generationVersion: "gv-commit", language: "en" }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.access[0].cacheCommitStatus, "committed");
+    assert.equal(calls.commitCalls, 1);
+    assert.deepEqual(calls.commitRequests[0], {
+      contractVersion: "1.1",
+      cacheReceiptId: "receipt-CMIT-1",
+      requestId,
+      ticker: "CMIT",
+      reportType: "regular",
+      generationVersion: "gv-commit",
+      language: "en",
+      resultDigest: calls.commitRequests[0].resultDigest,
+    });
+    assert.match(calls.commitRequests[0].resultDigest, /^[a-f0-9]{64}$/);
+    assert.ok(calls.callOrder.indexOf("commit") > calls.callOrder.indexOf("provider"));
+    assert.equal(calls.authorizationHeaders.every((value) => value == null), true);
+  });
+}
+
+async function testCacheCommitRetryIsIdempotent() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["CRTY"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.access[0].cacheCommitStatus, "committed");
+    assert.equal(calls.commitCalls, 2);
+    assert.deepEqual(calls.commitRequests[0], calls.commitRequests[1]);
+    assert.equal(calls.yahooCalls, 1);
+    assert.equal(calls.transportRequestIds.size, 3);
+  }, { dropFirstCommitResponse: true });
+}
+
+async function testCacheCommitReceiptFailuresDoNotHideReport() {
+  for (const failure of [
+    { status: 410, error: "cache_receipt_expired" },
+    { status: 400, error: "cache_receipt_mismatch" },
+    { status: 409, error: "cache_receipt_already_used" },
+  ]) {
+    await withMockFetch(async (calls) => {
+      const response = await postAnalyze(validPayload({ tickers: [`CF${failure.status}`] }));
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.status, "processed");
+      assert.equal(body.access[0].cacheCommitStatus, "failed");
+      assert.equal(calls.yahooCalls, 1);
+      assert.equal(calls.commitCalls, 1);
+      assert.equal(calls.telegramCalls, 0);
+    }, { commitStatus: failure.status, commitError: failure.error });
+  }
+}
+
+async function testInvalidCoreHmacFailsClosed() {
+  const payload = validPayload({
+    tickers: ["HBAD"],
+    telegramChatId: "12345",
+    delivery: { sendToTelegram: true },
+  });
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(payload, { CORE_HMAC_SECRET: "wrong-scanner-hmac-secret-32-bytes-minimum" });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.errors[0].code, "failed_quota_service");
+    assert.equal(calls.hmacValid, false);
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.telegramCalls, 0);
+  });
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    assert.equal(response.status, 200);
+    assert.ok(calls.yahooCalls >= 1);
+    assert.ok(calls.telegramCalls >= 1);
+  });
+}
+
+async function testReceiptRequiredForNewAndRefresh() {
+  for (const quotaDecision of ["new_regular", "refresh_regular", "new_fundrep", "refresh_fundrep"]) {
+    await withMockFetch(async (calls) => {
+      const response = await postAnalyze(validPayload({
+        tickers: [`RCPT${quotaDecision.length}`],
+        reportType: quotaDecision.endsWith("fundrep") ? "fundrep" : "regular",
+        forceRefresh: quotaDecision.startsWith("refresh"),
+      }));
+      assert.equal(response.status, 503);
+      const body = await response.json();
+      assert.equal(body.status, "failed");
+      assert.equal(body.errors[0].code, "invalid_core_response");
+      assert.equal(calls.yahooCalls, 0);
+      assert.equal(calls.commitCalls, 0);
+    }, { accessBody: allowedAccessDecision({ quotaDecision, cacheReceiptId: null }) });
+  }
+}
+
+async function testDeniedCoreDecisionBlocksCacheProviderAndTelegram() {
+  await withMockFetch(async () => {
+    await postAnalyze(validPayload({ tickers: ["HDNY"], generationVersion: "hmac-v1" }));
+  });
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({
+      tickers: ["HDNY"],
+      generationVersion: "hmac-v1",
+      telegramChatId: "12345",
+      delivery: { sendToTelegram: true },
+    }), { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).status, "rejected");
+    assert.deepEqual(calls.callOrder, ["core"]);
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.telegramCalls, 0);
+  }, {
+    accessBody: {
+      contractVersion: "1.1",
+      allowed: false,
+      chargeUnits: 0,
+      quotaDecision: "rejected_no_access",
+      cacheStatus: "hit",
+      reportSource: "none",
+      remainingUnits: 10,
+      reason: "No access",
+    },
+  });
+}
+
 async function testAccessCheckRejectsBeforeAnalysis() {
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(validPayload({ userId: "user-2", chatId: "chat-2" }), {
-      BYPASS_QUOTA_CHECK: "false",
       ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-      INTERNAL_API_SECRET: "internal-secret",
+      CORE_HMAC_SECRET,
     });
     assert.equal(response.status, 200);
     const body = await response.json();
@@ -262,8 +507,7 @@ async function testAccessCheckRejectsBeforeAnalysis() {
     assert.equal(calls.yahooCalls, 0);
   }, {
     accessBody: {
-      contractVersion: "1.0",
-      requestId: "access-denied",
+      contractVersion: "1.1",
       allowed: false,
       chargeUnits: 0,
       quotaDecision: "rejected_no_quota",
@@ -279,9 +523,8 @@ async function testProductionFailsClosedWhenAccessUnavailable() {
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(validPayload({ userId: "user-3", chatId: "chat-3" }), {
       APP_ENV: "production",
-      BYPASS_QUOTA_CHECK: "true",
       ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-      INTERNAL_API_SECRET: "internal-secret",
+      CORE_HMAC_SECRET,
     });
     assert.equal(response.status, 503);
     const body = await response.json();
@@ -300,6 +543,7 @@ async function testProviderFailureReturnsFailedStatus() {
     assert.equal(body.status, "failed");
     assert.equal(body.errors[0].code, "data_provider_error");
     assert.ok(calls.yahooCalls >= 1);
+    assert.equal(calls.commitCalls, 0);
   }, { yahooStatus: 500 });
 }
 
@@ -315,9 +559,8 @@ async function testInternalScannerFailureReturnsFailedStatus() {
 
 async function testRegularCachedReportReturnedWithoutProviderCall() {
   const env = {
-    BYPASS_QUOTA_CHECK: "false",
     ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-    INTERNAL_API_SECRET: "internal-secret",
+    CORE_HMAC_SECRET,
   };
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(validPayload({ tickers: ["CACH"], language: "ru", generationVersion: "v1" }), env);
@@ -334,12 +577,16 @@ async function testRegularCachedReportReturnedWithoutProviderCall() {
     assert.equal(body.report.orchestrator.status, "technical_report_cache_hit");
     assert.equal(body.report.generationVersion, "v1");
     assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.commitCalls, 0);
+    assert.equal(calls.accessRequests[0].cacheStatus, "hit");
+    assert.equal(typeof calls.accessRequests[0].cacheCreatedAt, "string");
+    assert.equal(calls.accessRequests[0].cacheGenerationVersion, "v1");
   }, {
     accessBody: {
-      contractVersion: "1.0",
+      contractVersion: "1.1",
       allowed: true,
       chargeUnits: 0,
-      quotaDecision: "own_repeat",
+      quotaDecision: "cached_regular",
       cacheStatus: "hit",
       reportSource: "cached_report",
       remainingUnits: 10,
@@ -351,9 +598,8 @@ async function testRegularCachedReportReturnedWithoutProviderCall() {
 async function testMissingPromisedCachedReportFailsClosed() {
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(validPayload({ tickers: ["MISS"], language: "ru", generationVersion: "v1" }), {
-      BYPASS_QUOTA_CHECK: "false",
       ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-      INTERNAL_API_SECRET: "internal-secret",
+      CORE_HMAC_SECRET,
     });
     assert.equal(response.status, 503);
     const body = await response.json();
@@ -362,10 +608,10 @@ async function testMissingPromisedCachedReportFailsClosed() {
     assert.equal(calls.yahooCalls, 0);
   }, {
     accessBody: {
-      contractVersion: "1.0",
+      contractVersion: "1.1",
       allowed: true,
       chargeUnits: 0,
-      quotaDecision: "own_repeat",
+      quotaDecision: "cached_regular",
       cacheStatus: "hit",
       reportSource: "cached_report",
       remainingUnits: 10,
@@ -408,7 +654,7 @@ async function testFundRepCachedReportReturnedWithoutProviders() {
     assert.equal(body.report.analysisType, "fundamental");
     assert.equal(body.report.cacheStatus, "hit");
     assert.equal(calls.yahooCalls, 0);
-  }, { accessBody: allowedAccessDecision({ chargeUnits: 0, quotaDecision: "own_repeat_fundrep", cacheStatus: "hit", reportSource: "cached_report" }) });
+  }, { accessBody: allowedAccessDecision({ chargeUnits: 0, quotaDecision: "cached_fundrep", cacheStatus: "hit", reportSource: "cached_report" }) });
 }
 
 async function testFundRepMissingCachedReportFailsClosed() {
@@ -422,7 +668,7 @@ async function testFundRepMissingCachedReportFailsClosed() {
     assert.equal(body.errors[0].code, "fundrep_cache_not_found");
     assert.equal(calls.yahooCalls, 0);
   }, {
-    accessBody: allowedAccessDecision({ chargeUnits: 0, quotaDecision: "own_repeat_fundrep", cacheStatus: "hit", reportSource: "cached_report" }),
+    accessBody: allowedAccessDecision({ chargeUnits: 0, quotaDecision: "cached_fundrep", cacheStatus: "hit", reportSource: "cached_report" }),
   });
 }
 
@@ -442,7 +688,7 @@ async function testFundRepExpiredCacheFailsClosed() {
       const body = await response.json();
       assert.equal(body.errors[0].code, "fundrep_cache_not_found");
       assert.equal(calls.yahooCalls, 0);
-    }, { accessBody: allowedAccessDecision({ reportSource: "cached_report", cacheStatus: "hit" }) });
+    }, { accessBody: allowedAccessDecision({ quotaDecision: "cached_fundrep", reportSource: "cached_report", cacheStatus: "hit" }) });
   } finally {
     Date.now = realNow;
   }
@@ -472,7 +718,7 @@ async function testInvalidForceRefreshCachedDecisionFailsClosed() {
     assert.equal(body.errors[0].code, "invalid_access_decision");
     assert.equal(calls.yahooCalls, 0);
     assert.equal(calls.telegramCalls, 0);
-  }, { accessBody: allowedAccessDecision({ reportSource: "cached_report", cacheStatus: "hit" }) });
+  }, { accessBody: allowedAccessDecision({ quotaDecision: "cached_fundrep", reportSource: "cached_report", cacheStatus: "hit" }) });
 }
 
 async function testRegularAndFundRepCachesDoNotIntersect() {
@@ -485,7 +731,7 @@ async function testRegularAndFundRepCachesDoNotIntersect() {
     assert.equal(response.status, 503);
     assert.equal((await response.json()).errors[0].code, "fundrep_cache_not_found");
     assert.equal(calls.yahooCalls, 0);
-  }, { accessBody: allowedAccessDecision({ reportSource: "cached_report", cacheStatus: "hit" }) });
+  }, { accessBody: allowedAccessDecision({ quotaDecision: "cached_fundrep", reportSource: "cached_report", cacheStatus: "hit" }) });
 }
 
 async function testFundRepCacheSeparatesLanguageAndGenerationVersion() {
@@ -498,7 +744,7 @@ async function testFundRepCacheSeparatesLanguageAndGenerationVersion() {
       assert.equal(response.status, 503);
       assert.equal((await response.json()).errors[0].code, "fundrep_cache_not_found");
       assert.equal(calls.yahooCalls, 0);
-    }, { accessBody: allowedAccessDecision({ reportSource: "cached_report", cacheStatus: "hit" }) });
+    }, { accessBody: allowedAccessDecision({ quotaDecision: "cached_fundrep", reportSource: "cached_report", cacheStatus: "hit" }) });
   }
 }
 
@@ -513,9 +759,12 @@ async function testFundRepMultiTickerMixedCache() {
     assert.equal(body.report.cacheStatus, "mixed");
     assert.deepEqual(body.report.fundamentalResults.map((item) => item.ticker), ["FMIX", "FNEW2"]);
     assert.equal(calls.fundamentalCalls, 1);
+    assert.equal(calls.commitCalls, 1);
+    assert.equal(calls.commitRequests[0].ticker, "FNEW2");
+    assert.equal(calls.commitRequests[0].cacheReceiptId, "receipt-FNEW2-2");
   }, {
     accessBody: (request) => allowedAccessDecision(request.ticker === "FMIX"
-      ? { chargeUnits: 0, quotaDecision: "own_repeat_fundrep", reportSource: "cached_report", cacheStatus: "hit" }
+      ? { chargeUnits: 0, quotaDecision: "cached_fundrep", reportSource: "cached_report", cacheStatus: "hit" }
       : {}),
   });
 }
@@ -532,25 +781,31 @@ async function testFundRepProviderFailureIsNotCached() {
     assert.equal(response.status, 503);
     assert.equal((await response.json()).errors[0].code, "fundrep_cache_not_found");
     assert.equal(calls.yahooCalls, 0);
-  }, { accessBody: allowedAccessDecision({ reportSource: "cached_report", cacheStatus: "hit" }) });
+  }, { accessBody: allowedAccessDecision({ quotaDecision: "cached_fundrep", reportSource: "cached_report", cacheStatus: "hit" }) });
 }
 
 async function testFundRepDuplicateRequestIdAndTelegramPrivacy() {
   const requestId = `fund-dup-${crypto.randomUUID()}`;
   await withMockFetch(async (calls) => {
-    const first = await postAnalyze(validPayload({
+    const payload = validPayload({
       requestId,
       tickers: ["FDUP"],
       reportType: "fundrep",
       telegramChatId: "12345",
       delivery: { sendToTelegram: true },
-    }), { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    });
+    const first = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
     assert.equal(first.status, 200);
-    const second = await postAnalyze(validPayload({ requestId, tickers: ["OTHER"], reportType: "fundrep" }));
+    const firstTelegramCalls = calls.telegramCalls;
+    const second = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
     assert.equal(second.status, 200);
     const secondBody = await second.json();
     assert.deepEqual(secondBody.report.tickers, ["FDUP"]);
     assert.equal(calls.fundamentalCalls, 1);
+    assert.equal(calls.accessCalls, 2);
+    assert.equal(calls.commitCalls, 1);
+    assert.ok(firstTelegramCalls > 0);
+    assert.equal(calls.telegramCalls, firstTelegramCalls);
     const userText = calls.telegramMessages.map((message) => `${message.text || ""}\n${message.caption || ""}`).join("\n");
     assert.equal(/requestId|quotaDecision|chargeUnits|remainingUnits|reportSource/.test(userText), false);
   });
@@ -594,15 +849,34 @@ async function testWrongTickerFormat() {
 async function testDuplicateRequestId() {
   await withMockFetch(async (calls) => {
     const requestId = `dup-${crypto.randomUUID()}`;
-    const first = await postAnalyze(validPayload({ requestId, tickers: ["DUPL"] }));
+    const payload = validPayload({ requestId, tickers: ["DUPL"] });
+    const first = await postAnalyze(payload);
     assert.equal(first.status, 200);
     const firstBody = await first.json();
-    const second = await postAnalyze(validPayload({ requestId, tickers: ["MSFT"] }));
+    const second = await postAnalyze(payload);
     assert.equal(second.status, 200);
     const secondBody = await second.json();
     assert.equal(secondBody.requestId, requestId);
     assert.deepEqual(secondBody.report.tickers, firstBody.report.tickers);
     assert.equal(calls.yahooCalls, 1);
+    assert.equal(calls.accessCalls, 2);
+    assert.equal(calls.commitCalls, 1);
+  });
+}
+
+async function testChangedDuplicatePayloadFailsClosed() {
+  await withMockFetch(async (calls) => {
+    const requestId = `changed-${crypto.randomUUID()}`;
+    const first = await postAnalyze(validPayload({ requestId, tickers: ["CHNG"], language: "ru" }));
+    assert.equal(first.status, 200);
+    const second = await postAnalyze(validPayload({ requestId, tickers: ["CHNG"], language: "en" }));
+    assert.equal(second.status, 503);
+    const body = await second.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.errors[0].code, "failed_quota_service");
+    assert.equal(calls.yahooCalls, 1);
+    assert.equal(calls.commitCalls, 1);
+    assert.equal(calls.accessCalls, 2);
   });
 }
 
@@ -691,9 +965,8 @@ async function testUnsupportedLanguageRejectedBeforeExternalCalls() {
       telegramChatId: "12345",
       delivery: { sendToTelegram: true },
     }), {
-      BYPASS_QUOTA_CHECK: "false",
       ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
-      INTERNAL_API_SECRET: "internal-secret",
+      CORE_HMAC_SECRET,
       TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token",
     });
     assert.equal(response.status, 400);
@@ -798,6 +1071,13 @@ async function testTelegramWebhookSecretRequired() {
 const tests = [
   testValidContractPayload,
   testAccessCheckAllowsAnalysis,
+  testCoreHmacRequestContract,
+  testCacheCommitFlowAndDigest,
+  testCacheCommitRetryIsIdempotent,
+  testCacheCommitReceiptFailuresDoNotHideReport,
+  testInvalidCoreHmacFailsClosed,
+  testReceiptRequiredForNewAndRefresh,
+  testDeniedCoreDecisionBlocksCacheProviderAndTelegram,
   testAccessCheckRejectsBeforeAnalysis,
   testProductionFailsClosedWhenAccessUnavailable,
   testProviderFailureReturnsFailedStatus,
@@ -819,6 +1099,7 @@ const tests = [
   testMissingContractVersion,
   testWrongTickerFormat,
   testDuplicateRequestId,
+  testChangedDuplicatePayloadFailsClosed,
   testScannerResponseFormat,
   testDeliverySendToTelegramFalse,
   testUpstreamLanguageControlsTelegramReport,

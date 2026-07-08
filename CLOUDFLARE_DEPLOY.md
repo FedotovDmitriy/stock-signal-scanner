@@ -88,12 +88,13 @@ You can add secrets from the Cloudflare dashboard UI:
 4. Open Settings -> Variables.
 5. Add each value as a Secret, not as a plain text variable.
 
-Required secrets:
+Required Worker settings (store token/secret values as Cloudflare secrets and URLs/key IDs as variables):
 
 - `SERVICE_TOKEN` - preferred service token for `POST /api/external/analyze`.
 - `WEBHOOK_TOKEN` - legacy scanner token and fallback service token.
-- `INTERNAL_API_SECRET` - internal service secret used by scanner when calling `market-signal-ai-bot`.
-- `ACCESS_CHECK_URL` - full internal quota/access endpoint URL, for example `https://market-signal-ai-bot.example.workers.dev/api/internal/access/check`.
+- `CORE_HMAC_SECRET` - scanner-specific HMAC secret shared with Core; store only as a Cloudflare secret and use at least 32 random bytes.
+- `CORE_HMAC_KEY_ID` - non-secret scanner signing key ID configured as an environment variable, with different values in dev and production.
+- `ACCESS_CHECK_URL` - non-secret full Core quota/access endpoint URL, for example `https://market-signal-ai-bot.example.workers.dev/api/internal/access/check`.
 - `MARKET_SIGNAL_AI_BOT_URL` - optional base URL alternative; if `ACCESS_CHECK_URL` is missing, scanner calls `<MARKET_SIGNAL_AI_BOT_URL>/api/internal/access/check`.
 - `REPORT_GENERATION_VERSION` - optional report cache generation version; defaults to `1`. Change it when report-generation logic changes and old cached reports must not be reused.
 - `DEFAULT_LANGUAGE` - optional language for direct Telegram commands; supports `ru`, `en`, and `he`, and defaults to `ru`. Contract requests use their upstream `language` value.
@@ -116,12 +117,12 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler secret put SERVICE_TOKEN
 npx wrangler secret put WEBHOOK_TOKEN
-npx wrangler secret put INTERNAL_API_SECRET
+npx wrangler secret put CORE_HMAC_SECRET
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 npx wrangler secret put ADMIN_TOKEN
 ```
 
-Add `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` as an environment variable in Cloudflare. For local-only testing you may set `BYPASS_QUOTA_CHECK=true`; do not enable quota bypass in production.
+Add `CORE_HMAC_KEY_ID` and `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` as environment variables in Cloudflare. There is no access-check bypass: dev and production both fail closed when Core signing configuration is missing or Core is unavailable.
 
 For production environment:
 
@@ -130,14 +131,18 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN --env production
 npx wrangler secret put TELEGRAM_CHAT_ID --env production
 npx wrangler secret put SERVICE_TOKEN --env production
 npx wrangler secret put WEBHOOK_TOKEN --env production
-npx wrangler secret put INTERNAL_API_SECRET --env production
+npx wrangler secret put CORE_HMAC_SECRET --env production
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET --env production
 npx wrangler secret put ADMIN_TOKEN --env production
 ```
 
-Production must have `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` configured. If the access check is unavailable or not configured, `POST /api/external/analyze` fails closed and does not run market-data analysis.
+Production must have `CORE_HMAC_KEY_ID`, `CORE_HMAC_SECRET`, and `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` configured. Scanner signs every access and cache-commit request with HMAC-SHA256 over `<timestamp>.<key_id>.<transport_request_id>.<method>.<pathname>.<canonical_query>.<sha256_raw_body>` and sends `X-Key-Id`, a unique transport `X-Request-Id`, `X-Timestamp`, and `X-Signature`. Scanner never sends the HMAC secret as Bearer authorization. If Core is unavailable, rejects HMAC, or returns an invalid response, `POST /api/external/analyze` fails closed before analysis, providers, or Telegram.
 
-Regular technical reports and structured FundRep reports are cached in `analysis_cache` for 60 minutes. Cache keys isolate ticker, report type, language, and generation version. When the access service returns `reportSource=cached_report`, scanner returns only the matching scanner-owned report and makes no Yahoo or Telegram call until delivery begins. Missing or expired regular cache returns `cached_report_not_found`; missing or expired FundRep cache returns `fundrep_cache_not_found`. Both fail closed with HTTP 503 and never start a new paid analysis silently.
+Before `POST /api/internal/access/check`, scanner reads only local cache metadata and signs the real `cacheStatus`, `cacheCreatedAt`, and `cacheGenerationVersion` as part of the request body. These fields are diagnostic hints; Core alone decides billing and whether `reportSource=cache` is valid.
+
+Allowed `new_*` and `refresh_*` decisions must contain a non-empty Core-issued `cacheReceiptId`. After a successful per-ticker analysis and local `analysis_cache` write, scanner computes SHA-256 over the exact stored JSON and calls HMAC-only `POST /api/internal/access/cache/commit` separately for every ticker. Commit retries use a new transport request ID and the same immutable receipt payload. Provider, analysis, or cache-write failures never commit. A commit failure is logged internally and does not discard or rerun the already paid successful report; because Core has no committed entry, scanner does not promise a future cache discount.
+
+Regular technical reports and structured FundRep reports are cached in `analysis_cache` for 60 minutes. Cache keys isolate ticker, report type, language, and generation version. When Core returns `reportSource=cache`, scanner returns only the matching scanner-owned report and makes no Yahoo call. Missing or expired regular cache returns `cached_report_not_found`; missing or expired FundRep cache returns `fundrep_cache_not_found`. Both fail closed with HTTP 503 and never start a new paid analysis silently. An identical business replay (`requestId + ticker`) still calls Core with a new transport ID, requires `own_repeat`, returns the stored Scanner response, and does not repeat providers, Telegram, or cache commit.
 
 `POST /api/external/analyze` with `reportType=fundrep` returns structured JSON with `analysisType=fundamental`, localized KPI summaries, risks, data sources, and `cacheStatus`. Supported cache statuses are `hit`, `miss`, `refreshed`, and `mixed`. `forceRefresh=true` bypasses scanner result and market-data caches, rebuilds FundRep, and replaces its cache entry. A contradictory access decision combining force refresh with `reportSource=cached_report` returns HTTP 503 with `invalid_access_decision`.
 

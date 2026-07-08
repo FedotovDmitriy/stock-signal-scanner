@@ -278,6 +278,23 @@ P1 FundRep API + Cache follow-up:
 Ready for:
 - Oleg QA retest.
 - Production deploy remains blocked until QA PASS.
+
+P0 Scanner HMAC integration follow-up:
+- Removed scanner-to-Core Bearer authentication and the quota bypass path.
+- Scanner now uses Web Crypto HMAC-SHA256 and Core contract `1.1` with `X-Key-Id`, unique transport `X-Request-Id`, Unix `X-Timestamp`, and `X-Signature`.
+- The canonical request covers timestamp, key ID, transport request ID, HTTP method, pathname, canonical query, and SHA-256 of the exact JSON body.
+- Added dedicated `CORE_HMAC_KEY_ID` and `CORE_HMAC_SECRET`; legacy `INTERNAL_API_SECRET` is not used as a production fallback.
+- Core access check always runs before scanner cache reads, Yahoo providers, and Telegram delivery.
+- `allowed=false`, Core timeout/unavailability, HMAC rejection, and malformed Core responses fail closed.
+- Scanner sends real signed cache metadata hints; Core decides cache eligibility from its committed cache ledger.
+- New and refresh decisions require a Core-issued receipt followed by a separate HMAC cache commit after local persistence.
+- Signatures, signing secrets, and full authentication headers are never logged or returned.
+- Scanner D1 migration: none.
+- Smoke suite PASS: 34 tests, including valid HMAC, no Bearer header, unique transport request IDs, body-bound signatures, Core-first ordering, wrong HMAC, denied access, unavailable Core, and invalid/expired/mismatched/missing cache claims.
+
+Integration blocker:
+- This report is superseded by the 2026-07-02 receipt/commit implementation report below.
+- Production remains blocked until dev end-to-end HMAC QA and Oleg QA pass.
 ```
 
 ## Task For Oleg - QA
@@ -819,6 +836,99 @@ The D1 assertion above used a local D1-compatible binding; deployed environment
 health, real D1 persistence, secrets, and rollback remain part of the DevOps gate.
 ```
 
+### Oleg P0 HMAC QA Report - 2026-07-01
+
+Status:
+
+```text
+FAIL
+```
+
+Checked:
+
+```text
+1. Correct HMAC signature - PASS
+   Core accepted Web Crypto HMAC-SHA256 over timestamp, key ID, unique transport
+   request ID, method, path, canonical query, and exact body hash. No Bearer header.
+
+2. Wrong secret and wrong key ID - PASS
+   Both fail closed with HTTP 503/status=failed; Yahoo and Telegram calls=0.
+
+3. Body changed after signing - PASS
+   Core signature verification rejected the changed body; scanner failed closed.
+
+4. Old timestamp - PASS
+   A timestamp 10 minutes old was rejected; Yahoo and Telegram calls=0.
+
+5. Repeated transport nonce - PASS
+   Simulated Core HTTP 409 replay rejection produced HTTP 503/status=failed;
+   no provider or Telegram calls. Multi-ticker requests use unique transport IDs.
+
+6. Receipt and cache commit protocol - SUPERSEDED
+   The current contract uses Core-issued receipts and a separate signed cache
+   commit. See the 2026-07-02 Grisha report below.
+
+7. Core allowed=false - PASS
+   HTTP 200/status=rejected; Core was the only external call.
+
+8. Core timeout, HTTP 404, HTTP 500, and invalid JSON - PASS
+   Every case failed closed with HTTP 503/status=failed/code=failed_quota_service.
+   Yahoo and Telegram calls=0 in every case.
+
+9. No cache/provider/Telegram activity on authentication rejection - PASS
+   D1-compatible binding smoke: analysis_cache reads=0, Yahoo calls=0,
+   Telegram calls=0 after Core HTTP 401.
+
+10. Idempotency without repeated charge decision - FAIL
+    First request: Core calls=1, Yahoo calls=1.
+    Duplicate business requestId: previous scanner result was returned and Yahoo
+    was not repeated, but Core was called again. Total Core calls=2.
+    The duplicate uses a new transport nonce and reaches Core before scanner reads
+    contract_results, so scanner does not guarantee that charging is performed once.
+
+11. Regular/FundRep/cache regression - PASS
+    Existing access, regular cache, FundRep cache, refresh, mixed cache, provider
+    failure, language, Telegram privacy, and contract tests remain green.
+
+12. Authentication data is absent from logs - PASS
+    Inspected request_logs/ticker_request_logs values after Core auth rejection.
+    HMAC secret, key ID, X-Signature, signature value, Authorization header, and
+    secret variable names were absent.
+```
+
+Regression:
+
+```text
+npm.cmd run test:worker-contract - PASS (34/34)
+node --check cloudflare/worker.js - PASS
+```
+
+Findings:
+
+```text
+1. [P0] Duplicate requestId repeats the Core access/charge call.
+   runContractAnalysisFromPayload calls checkContractAccessForTickers before
+   getContractResult. The saved scanner response prevents repeated analysis and
+   Telegram delivery, but it does not prevent a second Core billing decision.
+
+2. [P1] Automated idempotency tests do not assert Core/access call count.
+   The current tests assert one Yahoo/fundamental call, so the P0 billing replay
+   regression passes the 34-test suite.
+```
+
+Recommendation:
+
+```text
+Do not release the HMAC/quota integration yet.
+
+Return to Grisha to make billing idempotency explicit and atomic. A duplicate
+requestId must return the original result without a second charge, while also
+being bound to the original caller/request identity or payload hash. Add regular
+and FundRep tests that assert exactly one Core access call across duplicates.
+
+After the fix, rerun the 34-test suite and this focused P0 HMAC matrix.
+```
+
 ## Task For Ilya - DevOps / Cloudflare
 
 Priority: P0 for production gate, P1 for quota secrets
@@ -1158,6 +1268,38 @@ Production release remains blocked. Deploy the production core access endpoint a
 configure the Scanner production access bindings before restarting the gate from D1 backup.
 ```
 
+### Ilya P0 HMAC Deployment Readiness - 2026-07-01
+
+```text
+Status: BLOCKED / no production deploy
+
+Completed:
+- Scanner HMAC request signing is present.
+- Local HMAC, cache-claim, replay/fail-closed contract suite: PASS (34 checks).
+- Core dev /api/health: HTTP 200.
+- Core dev /api/internal/access/check without signature: HTTP 401.
+- Core production /api/health: HTTP 200.
+- Clock skew: approximately 36 seconds; acceptable for the five-minute window.
+- Safe key rotation and two-sided rollback runbook prepared:
+  docs/ilya-hmac-deployment-runbook.md
+
+Blocked:
+- Core production /api/internal/access/check returns HTTP 404.
+- Roman and Lena production PASS is not recorded.
+- Core dev already has a protected multi-key map; it must be merged by Core DevOps,
+  never overwritten without the protected source.
+- Scanner dev/production CORE_HMAC_SECRET is not configured.
+
+Proposed non-secret key IDs pending Core DevOps confirmation:
+- dev: scanner-dev-v1
+- production: scanner-prod-v1
+
+Decision:
+- No Core or Scanner secrets changed.
+- No Scanner deploy performed.
+- Production remains blocked until Core deploys first and Roman/Lena return PASS.
+```
+
 ## Task For Anna - Marketing / Product Analyst
 
 Priority: P2
@@ -1275,6 +1417,74 @@ Main signals for v1.2:
 - accidental force refresh complaints;
 - conversion after insufficient quota events;
 - whether users understand remaining balance after decimal charges.
+
+P0 HMAC / retry review - 2026-07-01:
+
+Recommendation:
+
+- HMAC does not change the analysis price and must never be a pricing factor.
+- `chargeUnits` continues to depend only on report type, cache/ownership decision,
+  and explicit force refresh under the accepted quota model.
+- A failed HMAC check, replay rejection, Core timeout, or malformed Core response
+  is a technical failure with 0 units charged. It is not a quota rejection.
+- Production release remains blocked until one business `requestId` is proven to
+  produce no more than one Core billing decision for both regular and FundRep.
+
+Why:
+
+- HMAC protects service-to-service transport; it does not create additional value
+  for the user and therefore cannot justify a different price.
+- A transport retry is not a new user purchase. Charging again would feel unfair
+  and would make transient network failures a monetization event.
+- Oleg's P0 QA found that the current scanner returns the saved analysis result but
+  calls Core again before reading it. Therefore absence of a repeated charge on
+  retry is not confirmed in the current implementation.
+- A repeated transport nonce is rejected correctly, but this does not solve a retry
+  of the same business `requestId` with a new transport nonce.
+
+Risks:
+
+- Core may make a second charge decision when the scanner retries the same business
+  request, even though analysis and Telegram delivery are not repeated.
+- Mixing Core failures with insufficient-quota events would inflate monetization
+  funnel losses and hide reliability or authentication incidents.
+- Treating replay protection as billing idempotency can create a false release PASS:
+  they protect different layers and both are required.
+
+What the developer must do:
+
+1. Make billing idempotency explicit and atomic by business `requestId`, bound to
+   the original caller and payload hash.
+2. Return the original decision/result for a duplicate request without a second
+   charge or a second Core billing decision.
+3. Add regular and FundRep tests asserting exactly one Core charge decision across
+   retries/replays of the same business request.
+4. Record separate non-sensitive analytics categories:
+   - `quota_denied`: `rejected_no_quota`;
+   - `access_denied`: `rejected_no_access`;
+   - `core_failed`: timeout/unavailable, HTTP 4xx/5xx authentication or contract
+     failure, invalid JSON/response, invalid cache claim;
+   - `replay_rejected`: repeated or stale transport authentication request;
+   - `idempotent_repeat`: duplicate business request returned without a new charge.
+5. Never include HMAC secrets, signatures, full authentication headers, or raw
+   internal error bodies in analytics.
+
+What the user should see:
+
+- For Core/HMAC/replay technical failures: "Сейчас не удалось проверить доступ к
+  анализу. Попробуйте ещё раз чуть позже." No units-charged message is shown.
+- For insufficient quota: the separate approved no-quota message.
+- For an idempotent retry: the original report and original charge information,
+  without a second debit notification.
+
+Decision status:
+
+- HMAC price neutrality: CONFIRMED as product rule.
+- Replay protection at transport level: PASS in Oleg's focused QA.
+- No repeated billing decision on business retry: FAIL / release blocker until fixed
+  and retested.
+- Separate Core-versus-quota analytics taxonomy: FIXED in this recommendation;
+  implementation remains required in `market-signal-ai-bot` analytics.
 ```
 
 ## Task For Masha - Designer
@@ -1348,6 +1558,13 @@ Finalization update:
 - Limited user-facing placeholders to `{ticker}`, `{units}`, and `{remaining_units}`.
 - Prohibited direct rendering of raw scanner/access fields, including `quotaDecision`, `cacheStatus`, `reportSource`, `chargeUnits`, `remainingUnits`, `reason`, and `requestId`.
 - Added a safe fallback for unknown states: show the localized temporary-unavailability message and log technical details privately.
+
+Access-message confirmation update:
+- Confirmed access denied uses the existing `analysis.access.not_in_plan` RU/EN text.
+- Confirmed access-check failures use the existing `analysis.access.temporarily_unavailable` RU/EN text.
+- HMAC, signature, nonce, Core, stack traces, internal error codes, and raw failure reasons must never appear in user-facing messages.
+- HMAC/signature/nonce/Core and unknown internal failures all map to the neutral temporary-unavailability localization key.
+- Technical details may be recorded only in protected internal logs.
 
 Risks:
 - If bot implementation uses raw scanner fields, users may see technical wording.
@@ -1779,4 +1996,275 @@ Current blockers:
 4. Grisha may need follow-up if HTTP status policy does not match manager decision.
 5. Scanner technical cache for cached_report must be confirmed or implemented.
 6. Full localization remains a follow-up before multi-language launch.
+```
+
+## Grisha Report - P0 Scanner HMAC Access Commit 1.1 - 2026-07-02
+
+```text
+Developer Report
+
+Task ID: P0-SCANNER-HMAC-ACCESS-COMMIT-1.1
+Status: DONE LOCALLY / DEV E2E BLOCKED BY SCANNER TOKEN
+
+Changed:
+- files: cloudflare/worker.js, tests/worker-contract-smoke.mjs, CLOUDFLARE_DEPLOY.md
+- endpoints: Core POST /api/internal/access/check and POST /api/internal/access/cache/commit
+- schema: no migration; existing analysis_cache and contract_results are reused
+- env/secrets: CORE_HMAC_KEY_ID, CORE_HMAC_SECRET, ACCESS_CHECK_URL or MARKET_SIGNAL_AI_BOT_URL
+
+Implementation:
+- Core calls are HMAC-only. Bearer and quota bypass are not used.
+- Access bodies now contain real signed cacheStatus, cacheCreatedAt, and cacheGenerationVersion hints.
+- Unsupported legacy cache-response verification was removed.
+- Allowed new_* and refresh_* responses require a non-empty cacheReceiptId.
+- Each successfully stored per-ticker result is committed separately with SHA-256 of the exact stored JSON.
+- Commit retries use a new transport request ID and preserve immutable business fields and digest.
+- Provider, analysis, and cache-write failures do not commit.
+- Commit failure is logged internally, does not rerun analysis, and does not hide the successful report.
+- Exact requestId+ticker replay calls Core again, requires own_repeat, and returns contract_results without provider, Telegram, or commit replay.
+- Changed payload for the same business key fails closed.
+
+Tests:
+- command: node --check cloudflare/worker.js
+- result: PASS
+- command: node tests/worker-contract-smoke.mjs
+- result: PASS (38 tests)
+- covered: signed hit/miss hints, receipt requirement, analysis/cache/commit ordering, digest and immutable fields, commit retry/replay, expired/mismatched/used receipt, commit failure, provider failure without commit, multi-ticker receipts, own_repeat, changed duplicate payload, no Core Bearer header
+
+Dev verification:
+- scanner dev deploy: PASS, version 59547fbd-0f2c-4911-aaf6-76eafee3eab6
+- GET /api/status: HTTP 200, environment=dev, worker=online
+- POST /api/external/analyze: BLOCKED before Core with HTTP 403 authentication_failed because the available historical WEBHOOK_TOKEN no longer matches the deployed dev secret
+- Core/provider/cache commit were not reached by the blocked request
+
+Security:
+- secrets used: CORE_HMAC_SECRET only through Web Crypto HMAC
+- payload tokens accepted: no
+- protected endpoints: scanner external endpoint keeps X-Scanner-Token; Core transport uses HMAC headers
+- signatures, secrets, and full auth headers are not logged
+
+Risks:
+- Dev E2E requires the current dev WEBHOOK_TOKEN or SERVICE_TOKEN to be supplied through a secure local environment; do not paste it into reports or commit it.
+- Production remains blocked until Oleg QA PASS and DevOps manual gate.
+
+Ready for:
+- Oleg: QA retest
+- Roman: contract/idempotency review
+- Lena: release decision after QA and dev E2E
+```
+
+The older cache-claim and P0 QA sections above describe the superseded pre-receipt implementation. The current scanner follows Core contract 1.1 receipt/commit semantics documented in this report.
+
+## Ilya Report - P0 DEV E2E Scanner Auth Fix - 2026-07-08
+
+```text
+Environment: dev
+requestId: not executed remotely
+HTTP status: not executed remotely
+Core decision: local contract PASS; remote Core health PASS; unsigned access/check HTTP 401 as expected
+cache commit status: local contract PASS
+duplicate/own_repeat result: local contract PASS
+checked_at: 2026-07-08T12:57:45.6976306+04:00
+final status: FAIL / BLOCKED
+```
+
+What was checked:
+
+```text
+- Scanner dev Worker active version: 59547fbd-0f2c-4911-aaf6-76eafee3eab6.
+- Scanner dev secret names present: SERVICE_TOKEN, WEBHOOK_TOKEN, CORE_HMAC_SECRET, ADMIN_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_WEBHOOK_SECRET.
+- Current scanner auth behavior: SERVICE_TOKEN is primary for /api/external/analyze; WEBHOOK_TOKEN is legacy fallback only if SERVICE_TOKEN is absent.
+- Caller Worker confirmed: telegram-company-matcher-dev.
+- Caller secret name confirmed: STOCK_SIGNAL_SCANNER_TOKEN.
+- Caller target confirmed: https://stock-signal-scanner-dev.fnemoy.workers.dev/api/external/analyze.
+- Core dev health: HTTP 200.
+- Core dev unsigned /api/internal/access/check: HTTP 401, expected for HMAC-protected endpoint.
+- Local scanner contract suite: PASS, 38 checks.
+- Covered locally: Core access/check before analysis, new analysis, cache commit, duplicate requestId, own_repeat, FundRep, Core denied, Core unavailable/fail-closed.
+- Secret scan of scanner repo found no real deployed secret values; only test fixture constant was detected.
+```
+
+Blocked:
+
+```text
+Remote dev E2E was not executed because the active scanner SERVICE_TOKEN value is not readable back from Cloudflare and no protected local source was available.
+
+Per matcher task-board decision, do not rotate the shared stock-signal-scanner-dev SERVICE_TOKEN without coordinating all clients. Safe next step is either:
+1. obtain the active scanner SERVICE_TOKEN from the approved password manager/vault and set only telegram-company-matcher-dev STOCK_SIGNAL_SCANNER_TOKEN through protected input; or
+2. get explicit approval for coordinated dev token rotation across all clients, then set scanner SERVICE_TOKEN and caller STOCK_SIGNAL_SCANNER_TOKEN in one protected session.
+```
+
+Security:
+
+```text
+No secret values were printed, written to Git, added to task board, or included in logs/screenshots.
+```
+
+### Ilya Update - coordinated dev rotation and remote retry - 2026-07-08
+
+```text
+Environment: dev
+requestId: devops-e2e-regular-9a57e179-9c59-48ed-801d-326e6d846729
+HTTP status: 503
+Core decision: failed_quota_service
+cache commit status: not reached
+duplicate/own_repeat result: duplicate and own_repeat both failed closed before analysis with failed_quota_service
+checked_at: 2026-07-08T13:17:57.1646083+04:00
+final status: FAIL / BLOCKED BY CORE 404
+```
+
+What changed:
+
+```text
+- Coordinated dev token rotation was approved and completed.
+- New dev scanner SERVICE_TOKEN was generated in memory only.
+- The same token was written to telegram-company-matcher-dev STOCK_SIGNAL_SCANNER_TOKEN through protected stdin.
+- Core dev INTERNAL_API_SCOPES_JSON was added with non-secret scope allowlist:
+  scanner-dev-v2 -> scanner:access, scanner:cache
+  matcher-dev-v1 -> matcher:access, matcher:deliver
+```
+
+Remote retry results:
+
+```text
+- GET /api/status: HTTP 200.
+- wrong scanner token: HTTP 403.
+- valid scanner token: no longer returns HTTP 403.
+- regular analysis: HTTP 503, status=failed, reason=Access check HTTP 404.
+- duplicate requestId: HTTP 503, status=failed, reason=Access check HTTP 404.
+- own_repeat attempt: HTTP 503, status=failed, reason=Access check HTTP 404.
+- FundRep attempt: HTTP 503, status=failed, reason=Access check HTTP 404.
+- delivery.sendToTelegram=false remained false; Telegram was not sent.
+- Scanner response bodies did not contain the rotated token literal.
+```
+
+Safe log evidence:
+
+```text
+Scanner D1 request_logs show:
+- External contract analysis started.
+- Access check failed with failed_quota_service.
+- Final reason: Access check HTTP 404.
+
+This confirms incoming scanner auth is fixed and Scanner calls Core before provider/cache/Telegram, but live Core dev currently returns HTTP 404 to Scanner's access-check call.
+```
+
+Next owner:
+
+```text
+Core / market-signal-ai-bot owner should verify deployed market-signal-ai-bot-dev route handling for signed scanner-dev-v2 POST /api/internal/access/check.
+Production gate remains blocked.
+```
+
+### Ilya Report - SCANNER-P0-RETRY-E2E-AFTER-CORE-LIVE - 2026-07-08
+
+```text
+Environment: dev
+requestId: devops-core-live-regular-a3e04e85-fb5c-45a7-ac6f-1d7d43bf1f1c
+HTTP status: 503
+Core access/check status: failed_quota_service / Access check HTTP 404
+analysis processed or fail reason: failed before provider analysis; reason=Access check HTTP 404
+cache commit status: not reached
+duplicate own_repeat result: failed closed before analysis; reason=Access check HTTP 404
+checked_at: 2026-07-08T15:07:27.7994879+04:00
+final status: FAIL / BLOCKED BY CORE 404
+```
+
+Remote dev E2E retry:
+
+```text
+- Scanner dev deployed version: 105cd2c1-3d35-4aa2-9036-38c10f43cf9a.
+- Core dev deployed version: a04d7111-f9fa-4586-97a0-50545e5bc225.
+- Runtime ACCESS_CHECK_URL: https://market-signal-ai-bot-dev.fnemoy.workers.dev/api/internal/access/check.
+- Runtime CORE_HMAC_KEY_ID: scanner-dev-v2.
+- Core dev health: HTTP 200.
+- Core unsigned access/check: HTTP 401, expected for protected endpoint.
+- Scanner GET /api/status: HTTP 200.
+- Wrong scanner token: HTTP 403.
+- Valid scanner token: accepted by scanner; no HTTP 403.
+- Regular AMD request: HTTP 503, status=failed, reason=Access check HTTP 404.
+- Duplicate same requestId/ticker: HTTP 503, status=failed, reason=Access check HTTP 404.
+- Own-repeat AMD request with new requestId: HTTP 503, status=failed, reason=Access check HTTP 404.
+- FundRep AAPL request: HTTP 503, status=failed, reason=Access check HTTP 404.
+- delivery.sendToTelegram=false remained false; Telegram was not sent.
+- Response bodies did not contain the rotated token literal.
+```
+
+Safe evidence:
+
+```text
+Scanner D1 request_logs confirm:
+- External contract analysis started for the E2E request IDs.
+- Access check executed before analysis.
+- Access check failed with failed_quota_service.
+- Final detail: Access check HTTP 404.
+```
+
+404 checklist:
+
+```text
+- Deployed scanner version checked: PASS.
+- Runtime ACCESS_CHECK_URL checked: PASS.
+- Not old Worker/preview/prod Core URL: PASS; URL points to market-signal-ai-bot-dev.
+- Current blocker remains inside market-signal-ai-bot-dev signed scanner access/check handling.
+```
+
+Security:
+
+```text
+No secrets, signatures, tokens, or Authorization headers were logged in the report.
+```
+
+### Ilya Report - SCANNER-P0-LIVE-TAIL-SIGNED-E2E - 2026-07-08
+
+```text
+Environment: dev
+scanner requestId: devops-live-tail-347cb617-95ac-4878-8e89-5aee0bb99b9b
+Core active version: 73345693-a27c-4705-a6c5-1b703ac03d10
+Scanner active version: 4cc85c26-4461-4aeb-ad20-afa15e786206
+CORE_HMAC_KEY_ID: scanner-dev-v2
+Core URL pathname: /api/internal/access/check
+Core full URL without query: https://market-signal-ai-bot-dev.fnemoy.workers.dev/api/internal/access/check
+Query string: empty
+Trailing slash: false
+Core HTTP status: 404 as seen by Scanner
+Scanner final status: HTTP 503, status=failed, reason=Access check HTTP 404
+Cache commit status: not reached
+checked_at: 2026-07-08T20:02:43.2198653+04:00
+final status: FAIL / CORE TAIL DID NOT OBSERVE THE REQUEST
+```
+
+Live-tail evidence:
+
+```text
+- Core dev active version check: PASS, exact required version is active.
+- Scanner and Core tails were started before the signed E2E request.
+- Scanner tail produced events during the window.
+- Core tail produced 0 parsed events during the same window.
+- Core access/check event was not observed in Core tail.
+- Scanner response still reported Access check HTTP 404.
+```
+
+Route checks:
+
+```text
+- Direct unsigned POST without trailing slash:
+  https://market-signal-ai-bot-dev.fnemoy.workers.dev/api/internal/access/check -> HTTP 401.
+- Direct unsigned POST with trailing slash:
+  https://market-signal-ai-bot-dev.fnemoy.workers.dev/api/internal/access/check/ -> HTTP 404.
+- Scanner runtime ACCESS_CHECK_URL has no trailing slash.
+- Scanner runtime URL points to market-signal-ai-bot-dev, not preview, old Worker, or production.
+- Core deployment time 2026-07-08T11:07:27.407608Z; request time was after that deployment.
+```
+
+Conclusion:
+
+```text
+Actual Core execution was not proven by Core live tail. The safe evidence proves Scanner uses the intended dev URL and fails closed on a 404 response, but Core tail did not show the inbound signed request. Next step is for Core owner to inspect Cloudflare route/worker execution for signed subrequests around scanner requestId devops-live-tail-347cb617-95ac-4878-8e89-5aee0bb99b9b and time 2026-07-08T16:02Z.
+```
+
+Security:
+
+```text
+No SERVICE_TOKEN, CORE_HMAC_SECRET, X-Signature, Authorization, or X-Scanner-Token values were logged.
 ```

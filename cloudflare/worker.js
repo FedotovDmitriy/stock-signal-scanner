@@ -10,6 +10,7 @@ const TECHNICAL_REPORT_CACHE_TTL_SECONDS = 60 * 60;
 const FUNDREP_REPORT_CACHE_TTL_SECONDS = 60 * 60;
 const ORCHESTRATOR_RETRY_LIMIT = 2;
 const CONTRACT_VERSION = "1.0";
+const CORE_ACCESS_CONTRACT_VERSION = "1.1";
 const DEFAULT_GENERATION_VERSION = "1";
 const CONTRACT_STRATEGIES = ["trend", "breakout", "volume_avwap", "momentum"];
 const ACCESS_CHECK_PATH = "/api/internal/access/check";
@@ -212,9 +213,6 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     return contractRejectedResponse(requestId, validation.errors);
   }
 
-  const existing = await getContractResult(env, requestId);
-  if (existing) return existing;
-
   const normalized = normalizeExternalPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
   const { timeframe, strategies, risk, anchorBars, chatId, country, bot, news, delivery, language } = normalized;
@@ -233,7 +231,8 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     });
     await addLog(env, origin, "External contract analysis", tickers.join(", "), "started", `request=${requestId}; timeframe=${timeframe}`, logCountry);
 
-    const accessChecks = await checkContractAccessForTickers(env, normalized, origin, logCountry);
+    const existing = await getContractResult(env, requestId);
+    const accessChecks = await checkContractAccessForTickers(env, normalized, origin, logCountry, existing);
     const rejectedAccess = accessChecks.find((access) => access.allowed === false);
     if (rejectedAccess) {
       result = contractAccessRejectedResponse(normalized, accessChecks);
@@ -246,12 +245,26 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
         `request=${requestId}; quotaDecision=${rejectedAccess.quotaDecision || "-"}; reason=${rejectedAccess.reason || "-"}`,
         logCountry
       );
-      await setContractResult(env, requestId, result);
+      if (result.status === "rejected") await setContractResult(env, requestId, result);
+      return result;
+    }
+
+    if (existing) {
+      const ownRepeat = accessChecks.every((access) => access.allowed && isOwnRepeatDecision(access));
+      if (!ownRepeat) {
+        result = contractAccessFailureResponse(normalized, accessChecks, "Core did not confirm an idempotent repeat", "invalid_core_response");
+        return result;
+      }
+      return existing;
+    }
+
+    if (accessChecks.some((access) => isOwnRepeatDecision(access))) {
+      result = contractAccessFailureResponse(normalized, accessChecks, "Stored Scanner result is missing for Core own_repeat", "stored_result_not_found");
       return result;
     }
 
     normalized.forceRefresh = normalized.forceRefresh || accessChecks.some((access) => access.forceRefresh === true);
-    if (normalized.forceRefresh && accessChecks.some((access) => String(access.reportSource || "").toLowerCase() === "cached_report")) {
+    if (normalized.forceRefresh && accessChecks.some((access) => isCachedReportSource(access.reportSource))) {
       result = contractInvalidAccessDecisionResponse(normalized, accessChecks);
       await setContractResult(env, requestId, result);
       return result;
@@ -291,9 +304,12 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
         forceRefresh: normalized.forceRefresh,
       })
       : null;
+    let savedReports = new Map();
     if (freshResult) {
-      if (normalized.reportType === "fundrep") await cacheContractFundRepReports(env, normalized, freshResult, freshTickers);
-      else await cacheContractTechnicalReports(env, normalized, freshResult, freshTickers);
+      savedReports = normalized.reportType === "fundrep"
+        ? await cacheContractFundRepReports(env, normalized, freshResult, freshTickers)
+        : await cacheContractTechnicalReports(env, normalized, freshResult, freshTickers);
+      await commitContractCacheReceipts(env, normalized, accessChecks, savedReports, origin, logCountry);
     }
     const scannerResult = mergeContractScannerResults(normalized, freshResult, cachedReports.results);
     scannerResult.cacheStatus = contractCacheStatus(normalized, freshTickers.length, cachedReports.results.size);
@@ -1504,7 +1520,8 @@ function contractFailedResponse(requestId, error) {
 
 function contractAccessRejectedResponse(normalized, accessChecks) {
   const primary = accessChecks.find((access) => access.allowed === false) || accessChecks[0] || {};
-  const failed = primary.quotaDecision === "failed_quota_service";
+  const failureCode = primary.failureCode || null;
+  const failed = Boolean(failureCode);
   return {
     contractVersion: CONTRACT_VERSION,
     requestId: normalized.requestId,
@@ -1516,7 +1533,7 @@ function contractAccessRejectedResponse(normalized, accessChecks) {
       contractError(
         "access",
         primary.reason || "Access or quota check rejected the request",
-        primary.quotaDecision || "rejected_no_access"
+        failureCode || primary.quotaDecision || "rejected_no_access"
       ),
     ],
   };
@@ -1535,6 +1552,18 @@ function contractInvalidAccessDecisionResponse(normalized, accessChecks) {
       "forceRefresh cannot be combined with reportSource=cached_report",
       "invalid_access_decision"
     )],
+  };
+}
+
+function contractAccessFailureResponse(normalized, accessChecks, message, code) {
+  return {
+    contractVersion: CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    status: "failed",
+    report: null,
+    access: normalizeAccessChecks(accessChecks),
+    telegram: { sendToTelegram: false, delivered: false, chatId: null },
+    errors: [contractError("access", message, code)],
   };
 }
 
@@ -1566,7 +1595,7 @@ function contractHttpStatus(result = {}) {
     return 400;
   }
   if (result.status === "failed") {
-    if (errors.some((error) => error.code === "failed_quota_service")) return 503;
+    if (errors.some((error) => ["failed_quota_service", "invalid_core_response", "stored_result_not_found"].includes(error.code))) return 503;
     if (errors.some((error) => ["cached_report_not_found", "fundrep_cache_not_found", "invalid_access_decision"].includes(error.code))) return 503;
     if (errors.some((error) => error.code === "data_provider_error")) return 502;
     return 500;
@@ -1617,7 +1646,7 @@ function contractProcessedResponse(normalized, scannerResult, telegram, accessCh
 
 function normalizeAccessChecks(accessChecks = []) {
   return accessChecks.map((access) => ({
-    contractVersion: access.contractVersion || CONTRACT_VERSION,
+    contractVersion: access.contractVersion || CORE_ACCESS_CONTRACT_VERSION,
     requestId: access.requestId || null,
     ticker: access.ticker || null,
     allowed: access.allowed === true,
@@ -1627,6 +1656,11 @@ function normalizeAccessChecks(accessChecks = []) {
     reportSource: stringOrNull(access.reportSource),
     remainingUnits: numberOrNull(access.remainingUnits),
     reason: stringOrNull(access.reason),
+    cacheReceiptId: stringOrNull(access.cacheReceiptId),
+    cacheCommitStatus: stringOrNull(access.cacheCommitStatus),
+    requestCacheStatus: stringOrNull(access.requestCacheStatus),
+    requestCacheCreatedAt: stringOrNull(access.requestCacheCreatedAt),
+    requestCacheGenerationVersion: stringOrNull(access.requestCacheGenerationVersion),
   }));
 }
 
@@ -1649,7 +1683,7 @@ function scannerErrorStatus(code) {
 async function loadContractCachedTechnicalReports(env, normalized, accessChecks) {
   const results = new Map();
   const cachedTickers = accessChecks
-    .filter((access) => String(access.reportSource || "").toLowerCase() === "cached_report")
+    .filter((access) => isCachedReportSource(access.reportSource))
     .map((access) => access.ticker)
     .filter(Boolean);
   if (!cachedTickers.length) return { results, missing: [] };
@@ -1667,7 +1701,7 @@ async function loadContractCachedTechnicalReports(env, normalized, accessChecks)
 async function loadContractCachedFundRepReports(env, normalized, accessChecks) {
   const results = new Map();
   const cachedTickers = accessChecks
-    .filter((access) => String(access.reportSource || "").toLowerCase() === "cached_report")
+    .filter((access) => isCachedReportSource(access.reportSource))
     .map((access) => access.ticker)
     .filter(Boolean);
   const missing = [];
@@ -1680,6 +1714,7 @@ async function loadContractCachedFundRepReports(env, normalized, accessChecks) {
 }
 
 async function cacheContractTechnicalReports(env, normalized, scannerResult, tickers) {
+  const saved = new Map();
   for (const ticker of tickers) {
     const row = (scannerResult.rows || []).find((item) => item.ticker === ticker);
     if (!row) continue;
@@ -1696,17 +1731,20 @@ async function cacheContractTechnicalReports(env, normalized, scannerResult, tic
         cacheHit: false,
       },
     };
-    await setAnalysisCache(
+    const cacheWrite = await setAnalysisCache(
       env,
       technicalReportCacheKey(normalized, ticker),
       "technical_report",
       payload,
       TECHNICAL_REPORT_CACHE_TTL_SECONDS
     );
+    saved.set(ticker, cacheWrite);
   }
+  return saved;
 }
 
 async function cacheContractFundRepReports(env, normalized, scannerResult, tickers) {
+  const saved = new Map();
   for (const ticker of tickers) {
     const item = (scannerResult.items || []).find((candidate) => candidate.ticker === ticker);
     const fundamentals = scannerResult.fundamentalsByTicker?.[ticker];
@@ -1723,14 +1761,16 @@ async function cacheContractFundRepReports(env, normalized, scannerResult, ticke
       fundamentalsByTicker: { [ticker]: fundamentals },
       orchestrator: { status: "fundrep_report_cache", cacheHit: false },
     };
-    await setAnalysisCache(
+    const cacheWrite = await setAnalysisCache(
       env,
       fundRepReportCacheKey(normalized, ticker),
       "fundrep_report",
       payload,
       FUNDREP_REPORT_CACHE_TTL_SECONDS
     );
+    saved.set(ticker, cacheWrite);
   }
+  return saved;
 }
 
 function technicalReportCacheKey(normalized, ticker) {
@@ -1789,38 +1829,34 @@ function contractCacheStatus(normalized, freshCount, cachedCount) {
   return "miss";
 }
 
-async function checkContractAccessForTickers(env, normalized, origin = "-", country = "-") {
-  if (shouldBypassQuotaCheck(env)) {
-    return normalized.tickers.map((ticker) => ({
-      contractVersion: CONTRACT_VERSION,
-      requestId: normalized.requestId,
-      ticker: ticker.symbol,
-      allowed: true,
-      chargeUnits: null,
-      quotaDecision: "new_regular",
-      cacheStatus: "miss",
-      reportSource: "new_analysis",
-      remainingUnits: null,
-      reason: "Quota check bypassed in non-production environment",
-    }));
-  }
+function isCachedReportSource(value) {
+  return ["cache", "cached_report", "own_repeat"].includes(String(value || "").trim().toLowerCase());
+}
 
+function isOwnRepeatDecision(access) {
+  return String(access?.reportSource || "").toLowerCase() === "own_repeat" ||
+    ["own_repeat", "own_repeat_fundrep"].includes(String(access?.quotaDecision || "").toLowerCase());
+}
+
+async function checkContractAccessForTickers(env, normalized, origin = "-", country = "-", existingResult = null) {
   const endpoint = accessCheckUrl(env);
-  const secret = String(env.INTERNAL_API_SECRET || "").trim();
-  if (!endpoint || !secret) {
+  const keyId = String(env.CORE_HMAC_KEY_ID || "").trim();
+  const secret = String(env.CORE_HMAC_SECRET || "").trim();
+  if (!endpoint || !keyId || secret.length < 32) {
     return normalized.tickers.map((ticker) => accessFailedDecision(normalized, ticker.symbol, "Access check is not configured"));
   }
 
   const checks = [];
   for (const ticker of normalized.tickers) {
     try {
+      const cacheHint = existingAccessCacheHint(existingResult, ticker.symbol) || await contractCacheHint(env, normalized, ticker.symbol);
+      const body = JSON.stringify(accessCheckRequest(normalized, ticker.symbol, cacheHint));
+      const headers = await coreHmacHeaders("POST", endpoint, body, keyId, secret);
       const response = await fetch(endpoint, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${secret}`,
-        },
-        body: JSON.stringify(accessCheckRequest(normalized, ticker.symbol)),
+        headers,
+        body,
+        signal: AbortSignal.timeout(5000),
       });
       let data = null;
       try {
@@ -1832,21 +1868,17 @@ async function checkContractAccessForTickers(env, normalized, origin = "-", coun
         checks.push(accessFailedDecision(normalized, ticker.symbol, `Access check HTTP ${response.status}`));
         continue;
       }
-      checks.push(normalizeAccessCheckResponse(data, normalized, ticker.symbol));
+      checks.push(normalizeAccessCheckResponse(data, normalized, ticker.symbol, cacheHint));
     } catch (error) {
-      checks.push(accessFailedDecision(normalized, ticker.symbol, error.message || String(error)));
+      checks.push(accessFailedDecision(normalized, ticker.symbol, "Core access check unavailable"));
     }
   }
 
-  const failed = checks.find((check) => check.quotaDecision === "failed_quota_service");
+  const failed = checks.find((check) => check.failureCode);
   if (failed) {
-    await addLog(env, origin, "Access check", normalized.tickers.map((ticker) => ticker.symbol).join(", "), "error", failed.reason || "failed_quota_service", country);
+    await addLog(env, origin, "Access check", normalized.tickers.map((ticker) => ticker.symbol).join(", "), "error", failed.failureCode, country);
   }
   return checks;
-}
-
-function shouldBypassQuotaCheck(env) {
-  return !isProduction(env) && String(env.BYPASS_QUOTA_CHECK || "").trim().toLowerCase() === "true";
 }
 
 function isProduction(env) {
@@ -1860,48 +1892,196 @@ function accessCheckUrl(env) {
   return base ? `${base}${ACCESS_CHECK_PATH}` : "";
 }
 
-function accessCheckRequest(normalized, ticker) {
+function accessCheckRequest(normalized, ticker, cacheHint) {
   return {
-    contractVersion: CONTRACT_VERSION,
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
     requestId: normalized.requestId,
     userId: normalized.userId,
     chatId: normalized.chatId,
     ticker,
     reportType: normalized.reportType,
     generationVersion: normalized.generationVersion,
+    cacheStatus: cacheHint.cacheStatus,
+    cacheCreatedAt: cacheHint.cacheCreatedAt,
+    cacheGenerationVersion: cacheHint.cacheGenerationVersion,
     forceRefresh: normalized.forceRefresh,
     language: normalized.language,
   };
 }
 
-function normalizeAccessCheckResponse(data, normalized, ticker) {
+function normalizeAccessCheckResponse(data, normalized, ticker, cacheHint) {
+  if (data.contractVersion !== CORE_ACCESS_CONTRACT_VERSION || data.requestId !== normalized.requestId || typeof data.allowed !== "boolean") {
+    return accessFailedDecision(normalized, ticker, "Invalid Core response", "invalid_core_response");
+  }
+  const reportSource = stringOrNull(data.reportSource);
+  const quotaDecision = stringOrNull(data.quotaDecision) || (data.allowed === true ? "allowed" : "rejected_no_access");
+  const cacheReceiptId = stringOrNull(data.cacheReceiptId);
+  if (data.allowed && requiresCacheReceipt(quotaDecision) && !cacheReceiptId) {
+    return accessFailedDecision(normalized, ticker, "Core did not return cacheReceiptId for new/refresh decision", "invalid_core_response");
+  }
   return {
-    contractVersion: data.contractVersion || CONTRACT_VERSION,
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
     requestId: data.requestId || normalized.requestId,
     ticker,
     allowed: data.allowed === true,
     chargeUnits: numberOrNull(data.chargeUnits),
-    quotaDecision: stringOrNull(data.quotaDecision) || (data.allowed === true ? "allowed" : "rejected_no_access"),
+    quotaDecision,
     cacheStatus: stringOrNull(data.cacheStatus),
-    reportSource: stringOrNull(data.reportSource),
+    reportSource,
     remainingUnits: numberOrNull(data.remainingUnits),
     reason: stringOrNull(data.reason) || (data.allowed === true ? "Allowed" : "Rejected"),
+    cacheReceiptId,
+    requestCacheStatus: cacheHint.cacheStatus,
+    requestCacheCreatedAt: cacheHint.cacheCreatedAt,
+    requestCacheGenerationVersion: cacheHint.cacheGenerationVersion,
+    cacheCommitStatus: null,
+    failureCode: null,
   };
 }
 
-function accessFailedDecision(normalized, ticker, reason) {
+function requiresCacheReceipt(quotaDecision) {
+  return /^(new|refresh)_(regular|fundrep)$/.test(String(quotaDecision || "").toLowerCase());
+}
+
+function existingAccessCacheHint(existingResult, ticker) {
+  const access = (existingResult?.access || []).find((item) => item.ticker === ticker);
+  if (!access || !["hit", "miss"].includes(access.requestCacheStatus)) return null;
   return {
-    contractVersion: CONTRACT_VERSION,
+    cacheStatus: access.requestCacheStatus,
+    cacheCreatedAt: stringOrNull(access.requestCacheCreatedAt),
+    cacheGenerationVersion: stringOrNull(access.requestCacheGenerationVersion),
+  };
+}
+
+async function contractCacheHint(env, normalized, ticker) {
+  const cacheKey = normalized.reportType === "fundrep"
+    ? fundRepReportCacheKey(normalized, ticker)
+    : technicalReportCacheKey(normalized, ticker);
+  const entry = await getAnalysisCacheEntry(env, cacheKey);
+  const valid = normalized.reportType === "fundrep"
+    ? isValidCachedFundRep(entry?.payload, ticker)
+    : Boolean(entry?.payload?.rows?.some((row) => row.ticker === ticker));
+  if (!entry || !valid) return { cacheStatus: "miss", cacheCreatedAt: null, cacheGenerationVersion: null };
+  return {
+    cacheStatus: "hit",
+    cacheCreatedAt: entry.createdAt,
+    cacheGenerationVersion: normalized.generationVersion,
+  };
+}
+
+function accessFailedDecision(normalized, ticker, reason, failureCode = "failed_quota_service") {
+  return {
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
     requestId: normalized.requestId,
     ticker,
     allowed: false,
     chargeUnits: null,
-    quotaDecision: "failed_quota_service",
+    quotaDecision: failureCode,
     cacheStatus: null,
     reportSource: null,
     remainingUnits: null,
     reason,
+    cacheReceiptId: null,
+    failureCode,
   };
+}
+
+async function coreHmacHeaders(method, endpoint, body, keyId, secret) {
+  const url = new URL(endpoint);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const requestId = `scanner_${crypto.randomUUID()}`;
+  const bodyHash = await sha256Hex(body);
+  const canonical = `${timestamp}.${keyId}.${requestId}.${method.toUpperCase()}.${url.pathname}.${canonicalQuery(url.searchParams)}.${bodyHash}`;
+  const signature = await hmacHex(secret, canonical);
+  return {
+    "Content-Type": "application/json",
+    "X-Key-Id": keyId,
+    "X-Request-Id": requestId,
+    "X-Timestamp": timestamp,
+    "X-Signature": `sha256=${signature}`,
+  };
+}
+
+async function commitContractCacheReceipts(env, normalized, accessChecks, savedReports, origin, country) {
+  for (const access of accessChecks) {
+    if (!requiresCacheReceipt(access.quotaDecision)) continue;
+    const saved = savedReports.get(access.ticker);
+    if (!saved || !access.cacheReceiptId) continue;
+    const commit = await commitCoreCacheReceipt(env, normalized, access, saved.resultDigest);
+    access.cacheCommitStatus = commit.ok ? "committed" : "failed";
+    if (!commit.ok) {
+      await addLog(
+        env,
+        origin,
+        "Core cache commit",
+        access.ticker,
+        "error",
+        `request=${normalized.requestId}; code=${commit.code}`,
+        country
+      );
+    }
+  }
+}
+
+async function commitCoreCacheReceipt(env, normalized, access, resultDigest) {
+  const accessEndpoint = accessCheckUrl(env);
+  const endpoint = accessEndpoint ? new URL("/api/internal/access/cache/commit", accessEndpoint).toString() : "";
+  const keyId = String(env.CORE_HMAC_KEY_ID || "").trim();
+  const secret = String(env.CORE_HMAC_SECRET || "").trim();
+  if (!endpoint || !keyId || secret.length < 32) return { ok: false, code: "cache_commit_not_configured" };
+  const body = JSON.stringify({
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
+    cacheReceiptId: access.cacheReceiptId,
+    requestId: normalized.requestId,
+    ticker: access.ticker,
+    reportType: normalized.reportType,
+    generationVersion: normalized.generationVersion,
+    language: normalized.language,
+    resultDigest,
+  });
+  let lastCode = "cache_commit_unavailable";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const headers = await coreHmacHeaders("POST", endpoint, body, keyId, secret);
+      const response = await fetch(endpoint, { method: "POST", headers, body, signal: AbortSignal.timeout(5000) });
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+      if (response.ok && data?.contractVersion === CORE_ACCESS_CONTRACT_VERSION && data.committed === true) {
+        return { ok: true, cacheEntryId: stringOrNull(data.cacheEntryId), expiresAt: stringOrNull(data.expiresAt) };
+      }
+      lastCode = stringOrNull(data?.error) || `cache_commit_http_${response.status}`;
+      if (response.status < 500) break;
+    } catch {
+      lastCode = "cache_commit_unavailable";
+    }
+  }
+  return { ok: false, code: lastCode };
+}
+
+function canonicalQuery(searchParams) {
+  return [...searchParams.entries()]
+    .sort(([leftKey, leftValue], [rightKey, rightValue]) => leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue))
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+async function hmacHex(secret, value) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return bytesToHex(new Uint8Array(signature));
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function normalizeExternalPayload(payload, env) {
@@ -2251,6 +2431,11 @@ async function setContractResult(env, requestId, response) {
 }
 
 async function getAnalysisCache(env, cacheKey) {
+  const entry = await getAnalysisCacheEntry(env, cacheKey);
+  return entry?.payload ?? null;
+}
+
+async function getAnalysisCacheEntry(env, cacheKey) {
   if (!env.DB) {
     const cached = fallbackAnalysisCache.get(cacheKey);
     if (!cached) return null;
@@ -2258,11 +2443,11 @@ async function getAnalysisCache(env, cacheKey) {
       fallbackAnalysisCache.delete(cacheKey);
       return null;
     }
-    return cached.payload;
+    return { payload: cached.payload, createdAt: new Date(cached.createdAt).toISOString(), expiresAt: new Date(cached.expiresAt).toISOString() };
   }
   await ensureOrchestratorTables(env);
   const row = await env.DB.prepare(
-    "SELECT payload_json, expires_at FROM analysis_cache WHERE cache_key = ?"
+    "SELECT payload_json, created_at, expires_at FROM analysis_cache WHERE cache_key = ?"
   ).bind(cacheKey).first();
   if (!row) return null;
   if (new Date(row.expires_at).getTime() <= Date.now()) {
@@ -2270,25 +2455,29 @@ async function getAnalysisCache(env, cacheKey) {
     return null;
   }
   try {
-    return JSON.parse(row.payload_json);
+    return { payload: JSON.parse(row.payload_json), createdAt: row.created_at, expiresAt: row.expires_at };
   } catch {
     return null;
   }
 }
 
 async function setAnalysisCache(env, cacheKey, kind, payload, ttlSeconds) {
+  const createdAtMs = Date.now();
+  const createdAt = new Date(createdAtMs).toISOString();
+  const expiresAt = new Date(createdAtMs + ttlSeconds * 1000).toISOString();
+  const payloadJson = JSON.stringify(payload);
   if (!env.DB) {
-    fallbackAnalysisCache.set(cacheKey, { kind, payload, expiresAt: Date.now() + ttlSeconds * 1000 });
-    return;
+    fallbackAnalysisCache.set(cacheKey, { kind, payload, createdAt: createdAtMs, expiresAt: createdAtMs + ttlSeconds * 1000 });
+    return { payload, createdAt, expiresAt, resultDigest: await sha256Hex(payloadJson) };
   }
   await ensureOrchestratorTables(env);
-  const now = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
   await env.DB.prepare(
     `INSERT INTO analysis_cache (cache_key, kind, payload_json, expires_at, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(cache_key) DO UPDATE SET kind=excluded.kind, payload_json=excluded.payload_json, expires_at=excluded.expires_at, updated_at=excluded.updated_at`
-  ).bind(cacheKey, kind, JSON.stringify(payload), expiresAt, now, now).run();
+     ON CONFLICT(cache_key) DO UPDATE SET kind=excluded.kind, payload_json=excluded.payload_json,
+       expires_at=excluded.expires_at, created_at=excluded.created_at, updated_at=excluded.updated_at`
+  ).bind(cacheKey, kind, payloadJson, expiresAt, createdAt, createdAt).run();
+  return { payload, createdAt, expiresAt, resultDigest: await sha256Hex(payloadJson) };
 }
 
 async function recordAnalysisTask(env, task) {
