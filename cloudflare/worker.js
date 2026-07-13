@@ -1,13 +1,21 @@
 ﻿const DEFAULT_TIMEFRAME = "1d";
+import { fundMetricLabel, isSupportedReportLanguage, normalizeReportLanguage, reportText } from "./report-i18n.js";
+
 const DEFAULT_STRATEGIES = ["trend", "breakout", "volume_avwap", "momentum"];
 const MAX_TICKER_LENGTH = 12;
 const TICKER_PATTERN = /^[A-Z][A-Z0-9.\-=]{0,11}$/;
 const MARKET_CACHE_TTL_SECONDS = 15 * 60;
 const RESULT_CACHE_TTL_SECONDS = 15 * 60;
+const TECHNICAL_REPORT_CACHE_TTL_SECONDS = 60 * 60;
+const FUNDREP_REPORT_CACHE_TTL_SECONDS = 60 * 60;
 const ORCHESTRATOR_RETRY_LIMIT = 2;
 const CONTRACT_VERSION = "1.0";
+const CORE_ACCESS_CONTRACT_VERSION = "1.1";
+const DEFAULT_GENERATION_VERSION = "1";
 const CONTRACT_STRATEGIES = ["trend", "breakout", "volume_avwap", "momentum"];
+const ACCESS_CHECK_PATH = "/api/internal/access/check";
 const fallbackContractResults = new Map();
+const fallbackAnalysisCache = new Map();
 
 const TIMEFRAMES = {
   "1m": { interval: "1m", range: "7d" },
@@ -34,6 +42,7 @@ export default {
           endpoints: ["/api/status", "/api/admin/access-list", "/scan", "/api/external/analyze", "/api/webhook/analyze", "/api/test-telegram", "/api/clear-logs", "/telegram/webhook"],
         });
       }
+
       if (request.method === "GET" && url.pathname === "/api/status") {
         const logs = await latestLogs(env);
         const tickerLogs = await latestTickerLogs(env);
@@ -81,9 +90,14 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/api/external/analyze") {
         const payload = await readJson(request);
-        assertServiceToken(request, env);
+        try {
+          assertServiceToken(request, env);
+        } catch (error) {
+          const requestId = stringOrNull(payload?.requestId);
+          return json(contractRejectedResponse(requestId, [contractError("auth", error.message || String(error), "authentication_failed")]), 403);
+        }
         const result = await runContractAnalysisFromPayload(payload, env, `external ip=${clientIp(request)}`, requestCountry(request), ctx);
-        return json(result, result.status === "rejected" ? 400 : 200);
+        return json(result, contractHttpStatus(result));
       }
       if (request.method === "POST" && ["/scan", "/api/webhook/analyze"].includes(url.pathname)) {
         const payload = await readJson(request);
@@ -123,7 +137,7 @@ export default {
 async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel = "-", ctx = null) {
   const normalized = normalizeExternalPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
-  if (!tickers.length) throw httpError("ÐŸÐµÑ€ÐµÐ´Ð°Ð¹Ñ‚Ðµ ticker Ð¸Ð»Ð¸ tickers", 400);
+  if (!tickers.length) throw httpError("Передайте ticker или tickers", 400);
 
   const { timeframe, strategies, risk, anchorBars, chatId, country, bot, news, delivery } = normalized;
   const requestKey = normalized.requestId || news?.id || crypto.randomUUID();
@@ -200,12 +214,9 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     return contractRejectedResponse(requestId, validation.errors);
   }
 
-  const existing = await getContractResult(env, requestId);
-  if (existing) return existing;
-
-  const normalized = normalizeExternalPayload(payload, env);
+  const normalized = normalizeContractPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
-  const { timeframe, strategies, risk, anchorBars, chatId, country, bot, news, delivery } = normalized;
+  const { timeframe, strategies, risk, anchorBars, country, news, language } = normalized;
   const logCountry = requestCountryLabel && requestCountryLabel !== "-" ? requestCountryLabel : payloadCountryLabel(country);
   let result;
 
@@ -216,34 +227,98 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
       tickers,
       status: "received",
       country: logCountry,
-      chatId,
+      chatId: null,
       detail: `contractVersion=${CONTRACT_VERSION}; timeframe=${timeframe}; request=${requestId}`,
     });
     await addLog(env, origin, "External contract analysis", tickers.join(", "), "started", `request=${requestId}; timeframe=${timeframe}`, logCountry);
+
+    const existing = await getContractResult(env, requestId);
+    const accessChecks = await checkContractAccessForTickers(env, normalized, origin, logCountry, existing);
+    const rejectedAccess = accessChecks.find((access) => access.allowed === false);
+    if (rejectedAccess) {
+      result = contractAccessRejectedResponse(normalized, accessChecks);
+      await addLog(
+        env,
+        origin,
+        "External contract analysis",
+        tickers.join(", "),
+        "rejected",
+        `request=${requestId}; quotaDecision=${rejectedAccess.quotaDecision || "-"}; reason=${rejectedAccess.reason || "-"}`,
+        logCountry
+      );
+      if (result.status === "rejected") await setContractResult(env, requestId, result);
+      return result;
+    }
+
+    if (existing) {
+      const acceptedDuplicate = accessChecks.every((access) => access.allowed === true);
+      if (!acceptedDuplicate) {
+        result = contractAccessFailureResponse(normalized, accessChecks, "Core did not confirm an idempotent repeat", "invalid_core_response");
+        return result;
+      }
+      return existing;
+    }
+
+    normalized.forceRefresh = normalized.forceRefresh || accessChecks.some((access) => access.forceRefresh === true);
+    if (normalized.forceRefresh && accessChecks.some((access) => isCachedReportSource(access.reportSource))) {
+      result = contractInvalidAccessDecisionResponse(normalized, accessChecks);
+      await setContractResult(env, requestId, result);
+      return result;
+    }
+
+    const cachedReports = normalized.reportType === "fundrep"
+      ? await loadContractCachedFundRepReports(env, normalized, accessChecks)
+      : await loadContractCachedTechnicalReports(env, normalized, accessChecks);
+    if (cachedReports.missing.length) {
+      result = contractCachedReportFailureResponse(normalized, accessChecks, cachedReports.missing);
+      await addLog(
+        env,
+        origin,
+        "External contract analysis",
+        tickers.join(", "),
+        "error",
+        `request=${requestId}; cached report missing=${cachedReports.missing.join(",")}`,
+        logCountry
+      );
+      await setContractResult(env, requestId, result);
+      return result;
+    }
+
     if (env.DB) await storeMatcherPayload(env, normalized, news?.id || requestId);
 
-    const scannerResult = await runAnalysisOrchestrator(env, {
-      source: normalized.source || "external_contract",
-      origin,
-      requestKey: requestId,
-      tickers,
-      config: { timeframe, strategies, risk, anchorBars },
-      request: normalized,
-    });
+    const freshTickers = tickers.filter((ticker) => !cachedReports.results.has(ticker));
+    const freshResult = freshTickers.length
+      ? normalized.reportType === "fundrep"
+        ? await runFundRepAnalysis(env, normalized, freshTickers, origin)
+        : await runAnalysisOrchestrator(env, {
+        source: normalized.source || "external_contract",
+        origin,
+        requestKey: requestId,
+        tickers: freshTickers,
+        config: { timeframe, strategies, risk, anchorBars, language, generationVersion: normalized.generationVersion },
+        request: normalized,
+        forceRefresh: normalized.forceRefresh,
+      })
+      : null;
+    let savedReports = new Map();
+    if (freshResult) {
+      savedReports = normalized.reportType === "fundrep"
+        ? await cacheContractFundRepReports(env, normalized, freshResult, freshTickers)
+        : await cacheContractTechnicalReports(env, normalized, freshResult, freshTickers);
+      await commitContractCacheReceipts(env, normalized, accessChecks, savedReports, origin, logCountry);
+    }
+    const scannerResult = mergeContractScannerResults(normalized, freshResult, cachedReports.results);
+    scannerResult.cacheStatus = contractCacheStatus(normalized, freshTickers.length, cachedReports.results.size);
     scannerResult.origin = origin;
     scannerResult.requestId = requestId;
     scannerResult.country = country;
-    scannerResult.bot = bot;
     scannerResult.news = news;
+    scannerResult.language = language;
+    scannerResult.access = accessChecks;
 
-    const telegram = { sendToTelegram: Boolean(chatId && delivery.sendToTelegram), delivered: false, chatId: chatId || null };
-    if (telegram.sendToTelegram) {
-      if (news) await sendTelegram(env, chatId, newsMessage(normalized), bot);
-      await sendTelegram(env, chatId, analysisReportMessage(scannerResult), bot);
-      telegram.delivered = true;
-    }
+    const telegram = { sendToTelegram: false, delivered: false, chatId: null };
 
-    result = contractProcessedResponse(normalized, scannerResult, telegram);
+    result = contractProcessedResponse(normalized, scannerResult, telegram, accessChecks);
     await addLog(
       env,
       origin,
@@ -311,6 +386,7 @@ async function handleTelegramUpdate(update, env, request) {
       strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
       risk: Number(env.DEFAULT_RISK || 1),
       anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+      language: env.DEFAULT_LANGUAGE || "ru",
     },
     request: { chatId, userId: telegramUserId(message), text },
   });
@@ -353,6 +429,7 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
         strategies: normalizeStrategies(env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES),
         risk: Number(env.DEFAULT_RISK || 1),
         anchorBars: Number(env.DEFAULT_ANCHOR_BARS || 120),
+        language: env.DEFAULT_LANGUAGE || "ru",
       },
       request: { chatId, userId, command: command.label },
     });
@@ -365,12 +442,13 @@ async function handleTelegramReportCommand(command, env, chatId, origin, country
         analysisType: "fundamental",
         requestId: result.requestId,
         fundamentals,
+        language: result.config?.language,
       });
-      await sendTelegram(env, chatId, fundamentalSummaryMessage(fundItem));
-      const html = fundRepHtml(ticker, result, fundamentals);
-      await sendTelegramDocument(env, chatId, `fundrep_${ticker}_${compactTimestamp(result.timestamp)}.html`, html, `FundRep ${ticker}: фундаментальный отчёт.`);
+      await sendTelegram(env, chatId, fundamentalSummaryMessage(fundItem, result.config?.language));
+      const html = fundRepHtml(ticker, result, fundamentals, result.config?.language);
+      await sendTelegramDocument(env, chatId, `fundrep_${ticker}_${compactTimestamp(result.timestamp)}.html`, html, reportText(result.config?.language, "fundTitle", { ticker }));
     } else {
-      await sendTelegram(env, chatId, promtRepMessage(ticker, result));
+      await sendTelegram(env, chatId, promtRepMessage(ticker, result, result.config?.language));
     }
     await addLog(env, origin, command.label, ticker, result.errors.length ? "partial" : "ok", `requestId=${requestId}; taskRequestId=${result.requestId}; errors=${result.errors.length}`, country);
   }
@@ -385,9 +463,10 @@ async function runAnalysisOrchestrator(env, job) {
   const taskId = `task_${requestKey}`;
   const source = job.source || "unknown";
   const origin = job.origin || "-";
+  const forceRefresh = job.forceRefresh === true;
 
   await ensureOrchestratorTables(env);
-  const cached = await getAnalysisCache(env, `result:${fingerprint}`);
+  const cached = forceRefresh ? null : await getAnalysisCache(env, `result:${fingerprint}`);
   if (cached) {
     const result = {
       ...cached,
@@ -428,7 +507,7 @@ async function runAnalysisOrchestrator(env, job) {
 
   try {
     await markAnalysisTask(env, taskId, "running", { attempts: 1, startedAt: new Date().toISOString() });
-    const result = await runWithRetries(async () => analyzeTickers(tickers, config, env), ORCHESTRATOR_RETRY_LIMIT);
+    const result = await runWithRetries(async () => analyzeTickers(tickers, config, env, { forceRefresh }), ORCHESTRATOR_RETRY_LIMIT);
     result.requestId = requestKey;
     result.analysisType = "technical";
     result.config = config;
@@ -468,7 +547,7 @@ async function runAnalysisOrchestrator(env, job) {
   }
 }
 
-async function analyzeTickers(tickers, config, env = {}) {
+async function analyzeTickers(tickers, config, env = {}, options = {}) {
   const rows = [];
   const errors = [];
   for (const ticker of tickers) {
@@ -477,9 +556,9 @@ async function analyzeTickers(tickers, config, env = {}) {
       continue;
     }
     try {
-      const candles = await runWithRetries(() => fetchCandles(ticker, config.timeframe, env), ORCHESTRATOR_RETRY_LIMIT);
+      const candles = await runWithRetries(() => fetchCandles(ticker, config.timeframe, env, options), ORCHESTRATOR_RETRY_LIMIT);
       const row = analyzeTicker(ticker, candles, config);
-      row.signals = row.signals.map((signal) => ({ ...signal, message: telegramSignalMessage(signal) }));
+      row.signals = row.signals.map((signal) => ({ ...signal, message: telegramSignalMessage(signal, config.language) }));
       rows.push(row);
     } catch (error) {
       errors.push({ ticker, error: error.message || String(error), code: error.code || "ANALYSIS_ERROR" });
@@ -494,10 +573,77 @@ async function analyzeTickers(tickers, config, env = {}) {
   };
 }
 
-async function fetchCandles(ticker, timeframe, env = {}) {
+async function runFundRepAnalysis(env, normalized, tickers, origin) {
+  const technical = await runAnalysisOrchestrator(env, {
+    source: `${normalized.source || "external_contract"}/fundrep`,
+    origin,
+    requestKey: `${normalized.requestId}:fundrep`,
+    tickers,
+    config: {
+      timeframe: normalized.timeframe,
+      strategies: normalized.strategies,
+      risk: normalized.risk,
+      anchorBars: normalized.anchorBars,
+      language: normalized.language,
+      generationVersion: normalized.generationVersion,
+    },
+    request: normalized,
+    forceRefresh: normalized.forceRefresh,
+  });
+  const fundamentalsByTicker = {};
+  const errors = [];
+
+  await Promise.all(tickers.map(async (ticker) => {
+    try {
+      const fundamentals = await fetchFundamentalData(ticker);
+      const row = (technical.rows || []).find((item) => item.ticker === ticker) || null;
+      const summary = buildFundamentalSummary(ticker, row, fundamentals, normalized.language);
+      if (!hasFundamentalSummary(summary)) {
+        throw analysisError(`${ticker}: empty fundamental report`, "DATA_PROVIDER_ERROR");
+      }
+      fundamentalsByTicker[ticker] = fundamentals;
+    } catch (error) {
+      errors.push({
+        ticker,
+        error: error.message || String(error),
+        code: error.code || "DATA_PROVIDER_ERROR",
+      });
+    }
+  }));
+
+  const result = {
+    timestamp: new Date().toISOString(),
+    timeframe: normalized.timeframe,
+    analysisType: "fundamental",
+    rows: technical.rows || [],
+    errors,
+    config: technical.config || normalizeAnalysisConfig(normalized),
+    fundamentalsByTicker,
+    orchestrator: {
+      ...(technical.orchestrator || {}),
+      status: "fundrep_completed",
+      reportType: "fundrep",
+    },
+  };
+  result.items = buildUnifiedItems({
+    tickers,
+    result,
+    analysisType: "fundamental",
+    requestId: normalized.requestId,
+    fundamentalsByTicker,
+  });
+  return result;
+}
+
+function hasFundamentalSummary(summary) {
+  const sections = [summary?.valuation, summary?.growth, summary?.profitability, summary?.debt];
+  return sections.some((section) => Object.values(section || {}).some((value) => value != null));
+}
+
+async function fetchCandles(ticker, timeframe, env = {}, options = {}) {
   const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
   const cacheKey = `market:${ticker}:${tf.interval}:${tf.range}`;
-  const cachedCandles = await getAnalysisCache(env, cacheKey);
+  const cachedCandles = options.forceRefresh ? null : await getAnalysisCache(env, cacheKey);
   if (cachedCandles) return cachedCandles;
   let data = null;
   let lastError = "";
@@ -567,30 +713,31 @@ function analyzeTicker(ticker, candles, config) {
   const low20 = Math.min(...candles.slice(-21, -1).map((candle) => candle.low));
   const atr = averageTrueRange(candles, 14);
   const signals = [];
+  const language = config.language;
 
   if (config.strategies.includes("trend") && ema200 && price > ema200 && price > avwap) {
-    signals.push(makeSignal(ticker, "Trend Following", "long", price, "цена выше EMA200 и выше AVWAP", "возможный long", price - atr * 2, price + atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Trend Following", "long", price, reportText(language, "trendLongCondition"), reportText(language, "trendLongIdea"), price - atr * 2, price + atr * 3, config.risk));
   }
   if (config.strategies.includes("trend") && ema200 && price < ema200 && price < avwap) {
-    signals.push(makeSignal(ticker, "Trend Following", "short", price, "цена ниже EMA200 и ниже AVWAP", "возможный short", price + atr * 2, price - atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Trend Following", "short", price, reportText(language, "trendShortCondition"), reportText(language, "trendShortIdea"), price + atr * 2, price - atr * 3, config.risk));
   }
   if (config.strategies.includes("breakout") && price > high20) {
-    signals.push(makeSignal(ticker, "Breakout Trading", "long", price, "пробой 20-свечного максимума", "импульсный long", price - atr * 1.8, price + atr * 3.2, config.risk));
+    signals.push(makeSignal(ticker, "Breakout Trading", "long", price, reportText(language, "breakoutLongCondition"), reportText(language, "breakoutLongIdea"), price - atr * 1.8, price + atr * 3.2, config.risk));
   }
   if (config.strategies.includes("breakout") && price < low20) {
-    signals.push(makeSignal(ticker, "Breakout Trading", "short", price, "пробой 20-свечного минимума", "импульсный short", price + atr * 1.8, price - atr * 3.2, config.risk));
+    signals.push(makeSignal(ticker, "Breakout Trading", "short", price, reportText(language, "breakoutShortCondition"), reportText(language, "breakoutShortIdea"), price + atr * 1.8, price - atr * 3.2, config.risk));
   }
   if (config.strategies.includes("volume_avwap") && price > avwap && price > poc) {
-    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "long", price, "цена выше AVWAP и выше POC", "покупатели удерживают контроль", Math.min(avwap, poc), price + atr * 2.5, config.risk));
+    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "long", price, reportText(language, "volumeLongCondition"), reportText(language, "volumeLongIdea"), Math.min(avwap, poc), price + atr * 2.5, config.risk));
   }
   if (config.strategies.includes("volume_avwap") && price < avwap && price < poc) {
-    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "short", price, "цена ниже AVWAP и ниже POC", "продавцы удерживают контроль", Math.max(avwap, poc), price - atr * 2.5, config.risk));
+    signals.push(makeSignal(ticker, "Volume Profile + AVWAP", "short", price, reportText(language, "volumeShortCondition"), reportText(language, "volumeShortIdea"), Math.max(avwap, poc), price - atr * 2.5, config.risk));
   }
   if (config.strategies.includes("momentum") && roc20 > 5 && rsi > 55) {
-    signals.push(makeSignal(ticker, "Momentum Trading", "long", price, `ROC20 ${roc20.toFixed(1)}% и RSI14 ${rsi.toFixed(0)}`, "моментум усиливается", price - atr * 2, price + atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Momentum Trading", "long", price, reportText(language, "momentumCondition", { roc: roc20.toFixed(1), rsi: rsi.toFixed(0) }), reportText(language, "momentumLongIdea"), price - atr * 2, price + atr * 3, config.risk));
   }
   if (config.strategies.includes("momentum") && roc20 < -5 && rsi < 45) {
-    signals.push(makeSignal(ticker, "Momentum Trading", "short", price, `ROC20 ${roc20.toFixed(1)}% и RSI14 ${rsi.toFixed(0)}`, "моментум вниз усиливается", price + atr * 2, price - atr * 3, config.risk));
+    signals.push(makeSignal(ticker, "Momentum Trading", "short", price, reportText(language, "momentumCondition", { roc: roc20.toFixed(1), rsi: rsi.toFixed(0) }), reportText(language, "momentumShortIdea"), price + atr * 2, price - atr * 3, config.risk));
   }
 
   return {
@@ -628,6 +775,7 @@ function makeSignal(ticker, strategy, side, price, condition, idea, stop, target
 }
 
 function buildUnifiedItems({ tickers, result, analysisType, requestId, fundamentalsByTicker = {} }) {
+  const language = normalizeReportLanguage(result.language || result.config?.language);
   const rowsByTicker = new Map((result.rows || []).map((row) => [row.ticker, row]));
   const errorsByTicker = new Map();
   for (const error of result.errors || []) {
@@ -638,14 +786,14 @@ function buildUnifiedItems({ tickers, result, analysisType, requestId, fundament
     const row = rowsByTicker.get(ticker);
     const errors = errorsByTicker.get(ticker) || [];
     const fundamentals = fundamentalsByTicker[ticker] || null;
-    return unifiedResultItem({ ticker, row, errors, analysisType, requestId, fundamentals });
+    return unifiedResultItem({ ticker, row, errors, analysisType, requestId, fundamentals, language });
   });
 }
 
-function unifiedResultItem({ ticker, row = null, errors = [], analysisType = "technical", requestId, fundamentals = null }) {
+function unifiedResultItem({ ticker, row = null, errors = [], analysisType = "technical", requestId, fundamentals = null, language = "ru" }) {
   return {
     ticker,
-    status: resultStatus(row, errors),
+    status: resultStatus(row, errors, analysisType, fundamentals),
     analysisType,
     price: row ? {
       value: row.price,
@@ -673,13 +821,13 @@ function unifiedResultItem({ ticker, row = null, errors = [], analysisType = "te
       risk: signal.risk,
       stop: round(signal.stop, 2),
       target: round(signal.target, 2),
-      explanation: `${signal.condition}. ${marketContext(row)}`,
+      explanation: `${signal.condition}. ${marketContext(row, language)}`,
     })) : [],
-    fundamentalSummary: fundamentals ? buildFundamentalSummary(ticker, row, fundamentals) : null,
-    dataSources: dataSourcesForItem(analysisType, fundamentals),
+    fundamentalSummary: fundamentals ? buildFundamentalSummary(ticker, row, fundamentals, language) : null,
+    dataSources: dataSourcesForItem(analysisType, fundamentals, row),
     errors: errors.map((error) => ({
       code: statusFromErrorCode(error.code),
-      message: error.error || error.message || String(error),
+      message: localizedStatus(statusFromErrorCode(error.code), language),
     })),
     requestId,
   };
@@ -700,7 +848,9 @@ function unifiedQueuedItem(ticker, analysisType, requestId) {
   };
 }
 
-function resultStatus(row, errors = []) {
+function resultStatus(row, errors = [], analysisType = "technical", fundamentals = null) {
+  if (analysisType === "fundamental" && fundamentals && errors.length) return "partial_result";
+  if (analysisType === "fundamental" && fundamentals) return fundamentals.fundrepDataStatus === "partial" ? "partial_result" : "no_signal";
   if (row && errors.length) return "partial_result";
   if (errors.some((error) => error.code === "INVALID_TICKER")) return "invalid_ticker";
   if (errors.some((error) => error.code === "INSUFFICIENT_DATA" || error.code === "NO_MARKET_DATA")) return "not_enough_data";
@@ -717,13 +867,15 @@ function statusFromErrorCode(code) {
   return "data_provider_error";
 }
 
-function dataSourcesForItem(analysisType, fundamentals = null) {
-  const sources = analysisType === "fundamental" ? ["Yahoo Finance quoteSummary", "Yahoo Finance quote"] : ["Yahoo Finance chart"];
-  if (fundamentals?.fundrepDataStatus) sources.push(fundamentals.fundrepDataStatus);
-  return sources;
+function dataSourcesForItem(analysisType, fundamentals = null, row = null) {
+  if (analysisType !== "fundamental") return ["Yahoo Finance chart"];
+  const technicalSource = row ? ["Yahoo Finance chart"] : [];
+  if (fundamentals?.fundrepDataStatus === "full") return ["Yahoo Finance quoteSummary", ...technicalSource];
+  if (fundamentals?.fundrepDataStatus === "partial") return ["Yahoo Finance quote", ...technicalSource];
+  return [];
 }
 
-function buildFundamentalSummary(ticker, row, data = {}) {
+function buildFundamentalSummary(ticker, row, data = {}, language = "ru") {
   return {
     valuation: {
       trailingPE: numberOrNull(metricValue(data, "summaryDetail", "trailingPE")),
@@ -756,27 +908,33 @@ function buildFundamentalSummary(ticker, row, data = {}) {
       roc20: row.roc20,
       aboveEma200: row.ema200 == null ? null : row.price > row.ema200,
     } : null,
-    keyRisks: fundamentalKeyRisks(row, data),
-    status: data.fundrepDataStatus || "Fundamental data summary built from available fields.",
+    keyRisks: fundamentalKeyRisks(row, data, language),
+    status: fundamentalDataStatus(data.fundrepDataStatus, language),
   };
 }
 
-function fundamentalKeyRisks(row, data = {}) {
+function fundamentalKeyRisks(row, data = {}, language = "ru") {
   const risks = [];
   const debtToEquity = numberOrNull(metricValue(data, "financialData", "debtToEquity"));
   const currentRatio = numberOrNull(metricValue(data, "financialData", "currentRatio"));
   const trailingPE = numberOrNull(metricValue(data, "summaryDetail", "trailingPE"));
   const revenueGrowth = numberOrNull(metricValue(data, "financialData", "revenueGrowth"));
-  if (debtToEquity != null && debtToEquity > 150) risks.push("Высокая долговая нагрузка относительно капитала.");
-  if (currentRatio != null && currentRatio < 1) risks.push("Текущая ликвидность ниже 1.");
-  if (trailingPE != null && trailingPE > 40) risks.push("Оценка по P/E выглядит требовательной.");
-  if (revenueGrowth != null && revenueGrowth < 0) risks.push("Выручка снижается.");
-  if (row && row.rsi14 > 70) risks.push("Технически акция может быть перегрета по RSI.");
-  if (row && row.rsi14 < 30) risks.push("Технически акция в зоне слабости по RSI.");
-  return risks.length ? risks : ["Ключевые риски требуют проверки по последней отчётности и новостям."];
+  if (debtToEquity != null && debtToEquity > 150) risks.push(reportText(language, "riskDebt"));
+  if (currentRatio != null && currentRatio < 1) risks.push(reportText(language, "riskLiquidity"));
+  if (trailingPE != null && trailingPE > 40) risks.push(reportText(language, "riskValuation"));
+  if (revenueGrowth != null && revenueGrowth < 0) risks.push(reportText(language, "riskRevenue"));
+  if (row && row.rsi14 > 70) risks.push(reportText(language, "riskOverbought"));
+  if (row && row.rsi14 < 30) risks.push(reportText(language, "riskWeak"));
+  return risks.length ? risks : [reportText(language, "riskDefault")];
 }
 
-function fundamentalSummaryMessage(item) {
+function fundamentalDataStatus(status, language = "ru") {
+  if (status === "full") return reportText(language, "dataFull");
+  if (status === "partial") return reportText(language, "dataPartial");
+  return reportText(language, "dataUnavailable");
+}
+
+function fundamentalSummaryMessage(item, language = "ru") {
   const summary = item.fundamentalSummary || {};
   const v = summary.valuation || {};
   const g = summary.growth || {};
@@ -784,22 +942,42 @@ function fundamentalSummaryMessage(item) {
   const d = summary.debt || {};
   const m = summary.momentum || {};
   return [
-    `FundRep KPI summary: ${item.ticker}`,
-    `Статус: ${item.status}`,
-    `requestId: ${item.requestId || "-"}`,
+    `${reportText(language, "fundSummary")}: ${item.ticker}`,
     "━━━━━━━━━━━━━━",
-    `Valuation: P/E ${fmtMetric(v.trailingPE)}, Forward P/E ${fmtMetric(v.forwardPE)}, P/S ${fmtMetric(v.priceToSales)}, P/B ${fmtMetric(v.priceToBook)}, Market Cap ${fmtMoney(v.marketCap)}`,
-    `Growth: Revenue ${fmtPercent(g.revenueGrowth)}, Earnings ${fmtPercent(g.earningsGrowth)}`,
-    `Profitability: Gross ${fmtPercent(p.grossMargins)}, Operating ${fmtPercent(p.operatingMargins)}, Net ${fmtPercent(p.profitMargins)}, ROE ${fmtPercent(p.returnOnEquity)}`,
-    `Debt: Debt ${fmtMoney(d.totalDebt)}, Cash ${fmtMoney(d.totalCash)}, D/E ${fmtMetric(d.debtToEquity)}, Current Ratio ${fmtMetric(d.currentRatio)}`,
-    `Momentum: Price ${fmtMetric(m.price)}, Change ${fmtPercent(m.changePercent)}, RSI ${fmtMetric(m.rsi14)}, ROC20 ${fmtPercent(m.roc20)}`,
-    `Key risks: ${(summary.keyRisks || []).join(" ")}`,
+    `${reportText(language, "valuation")}: P/E ${fmtMetric(v.trailingPE)}, Forward P/E ${fmtMetric(v.forwardPE)}, P/S ${fmtMetric(v.priceToSales)}, P/B ${fmtMetric(v.priceToBook)}, ${reportText(language, "marketCap")} ${fmtMoney(v.marketCap)}`,
+    `${reportText(language, "growth")}: ${reportText(language, "revenue")} ${fmtPercent(g.revenueGrowth)}, ${reportText(language, "earnings")} ${fmtPercent(g.earningsGrowth)}`,
+    `${reportText(language, "profitability")}: ${reportText(language, "gross")} ${fmtPercent(p.grossMargins)}, ${reportText(language, "operating")} ${fmtPercent(p.operatingMargins)}, ${reportText(language, "net")} ${fmtPercent(p.profitMargins)}, ROE ${fmtPercent(p.returnOnEquity)}`,
+    `${reportText(language, "debt")}: ${reportText(language, "debt")} ${fmtMoney(d.totalDebt)}, ${reportText(language, "cash")} ${fmtMoney(d.totalCash)}, D/E ${fmtMetric(d.debtToEquity)}, ${reportText(language, "currentRatio")} ${fmtMetric(d.currentRatio)}`,
+    `${reportText(language, "momentum")}: ${reportText(language, "price")} ${fmtMetric(m.price)}, ${reportText(language, "change")} ${fmtPercent(m.changePercent)}, RSI ${fmtMetric(m.rsi14)}, ROC20 ${fmtPercent(m.roc20)}`,
+    `${reportText(language, "keyRisks")}: ${(summary.keyRisks || []).join(" ")}`,
   ].join("\n");
 }
 
+async function sendFundRepContractTelegram(env, chatId, result, bot = {}) {
+  const language = result.language || result.config?.language || "ru";
+  for (const item of result.items || []) {
+    if (!item.fundamentalSummary || item.errors?.length) continue;
+    await sendTelegram(env, chatId, fundamentalSummaryMessage(item, language), bot);
+    const row = (result.rows || []).find((candidate) => candidate.ticker === item.ticker);
+    const fundamentals = result.fundamentalsByTicker?.[item.ticker];
+    if (!row || !fundamentals) continue;
+    const tickerResult = { ...result, rows: [row], errors: [] };
+    const html = fundRepHtml(item.ticker, tickerResult, fundamentals, language);
+    await sendTelegramDocument(
+      env,
+      chatId,
+      `fundrep_${item.ticker}_${compactTimestamp(result.timestamp)}.html`,
+      html,
+      reportText(language, "fundTitle", { ticker: item.ticker }),
+      bot
+    );
+  }
+}
+
 function analysisReportMessage(result) {
+  const language = normalizeReportLanguage(result.language || result.config?.language);
   const lines = [
-    "📊 Отчёт анализа",
+    `📊 ${reportText(language, "analysisTitle")}`,
     "━━━━━━━━━━━━━━",
     "",
   ];
@@ -810,109 +988,36 @@ function analysisReportMessage(result) {
     const arrow = price.direction === "up" ? "🟢⬆️" : price.direction === "down" ? "🔴⬇️" : "⚪➡️";
     const movement = price.value == null ? "-" : `${price.change > 0 ? "+" : ""}${Number(price.change || 0).toFixed(2)} (${price.changePercent > 0 ? "+" : ""}${Number(price.changePercent || 0).toFixed(2)}%)`;
     lines.push(`${arrow} ${item.ticker}`);
-    lines.push(`Статус: ${item.status}`);
-    if (price.value != null) lines.push(`Цена: ${Number(price.value).toFixed(2)}`);
-    lines.push(`Движение: ${movement}`);
+    lines.push(`${reportText(language, "status")}: ${localizedStatus(item.status, language)}`);
+    if (price.value != null) lines.push(`${reportText(language, "price")}: ${Number(price.value).toFixed(2)}`);
+    lines.push(`${reportText(language, "movement")}: ${movement}`);
     lines.push(`EMA200: ${valueOrDash(indicators.ema200)}, AVWAP: ${valueOrDash(indicators.avwap)}, RSI: ${valueOrDash(indicators.rsi14)}`);
-    lines.push(`ATR14: ${valueOrDash(indicators.atr14)}, MMA150: ${valueOrDash(indicators.mma150)}, от MMA150: ${distanceText(indicators.mma150DistancePercent)}`);
+    lines.push(`ATR14: ${valueOrDash(indicators.atr14)}, MMA150: ${valueOrDash(indicators.mma150)}, ${reportText(language, "distanceFromMma")}: ${distanceText(indicators.mma150DistancePercent)}`);
     if (item.signals.length) {
       lines.push("");
-      lines.push("✅ Сигналы:");
+      lines.push(`✅ ${reportText(language, "signals")}:`);
       item.signals.forEach((signal, index) => {
         if (index > 0) lines.push("━━━━━━━━━━━━━━");
         const icon = signal.side === "long" ? "📈" : "📉";
-        lines.push(`${icon} ${signal.side} / ${signal.strategy}`);
-        lines.push(`Почему: ${signal.explanation}`);
-        lines.push(`Условие: ${signal.condition}`);
-        lines.push(`Идея: ${signal.idea}`);
-        lines.push(`Стоп: ${Number(signal.stop).toFixed(2)}`);
-        lines.push(`Цель: ${Number(signal.target).toFixed(2)}`);
-        lines.push(`Риск: ${signal.risk}%`);
+        lines.push(`${icon} ${localizedSide(signal.side, language)} / ${localizedStrategy(signal.strategy, language)}`);
+        lines.push(`${reportText(language, "why")}: ${signal.explanation}`);
+        lines.push(`${reportText(language, "condition")}: ${signal.condition}`);
+        lines.push(`${reportText(language, "idea")}: ${signal.idea}`);
+        lines.push(`${reportText(language, "stop")}: ${Number(signal.stop).toFixed(2)}`);
+        lines.push(`${reportText(language, "target")}: ${Number(signal.target).toFixed(2)}`);
+        lines.push(`${reportText(language, "risk")}: ${signal.risk}%`);
       });
     } else if (item.status === "no_signal") {
       lines.push("");
-      lines.push("ℹ️ Нет сигнала:");
-      lines.push("Условия входа не подтвердились.");
+      lines.push(`ℹ️ ${reportText(language, "noSignal")}:`);
+      lines.push(reportText(language, "noSignalDetails"));
     } else if (item.errors.length) {
       lines.push("");
-      lines.push(item.status === "not_enough_data" ? "ℹ️ Нет данных для анализа:" : "⚠️ Ошибка:");
-      for (const error of item.errors) lines.push(`${error.code}: ${error.message}`);
+      lines.push(item.status === "not_enough_data" ? `ℹ️ ${reportText(language, "noData")}:` : `⚠️ ${reportText(language, "error")}:`);
+      for (const error of item.errors) lines.push(error.code);
     }
     lines.push("");
   }
-  return lines.join("\n").trim();
-}
-
-function fundRepMessage(ticker, result) {
-  const row = result.rows[0];
-  if (!row) return reportErrorMessage("FundRep", ticker, result);
-  const price = `${row.price.toFixed(2)} USD`;
-  const na = "н/д";
-  const lines = [
-    `FundRep: фундаментальный отчёт по ${ticker}`,
-    `Дата: ${result.timestamp}`,
-    "Не является инвестиционной рекомендацией.",
-    "━━━━━━━━━━━━━━",
-    "",
-    "1. Profitability / Прибыльность",
-    "Компания реально зарабатывает деньги и становится ли бизнес эффективнее?",
-    `Компания: ${ticker}`,
-    `Текущая цена: ${price}`,
-    "Рыночная цена нужна как отправная точка для сравнения с фундаментальными метриками.",
-    `Revenue Growth / Рост выручки: ${na}`,
-    "Показывает темп роста верхней строки. Ускорение роста обычно поддерживает оценку компании.",
-    `Gross Margin / Валовая маржа: ${na}`,
-    "Показывает ценовую силу продукта и эффективность себестоимости.",
-    `Operating Margin / Операционная маржа: ${na}`,
-    "Показывает прибыльность основного бизнеса после операционных расходов.",
-    `Net Margin / Чистая маржа: ${na}`,
-    "Показывает, сколько прибыли остаётся акционерам после всех расходов.",
-    `EPS / Прибыль на акцию: ${na}`,
-    `EBITDA: ${na}`,
-    "",
-    "2. Valuation / Оценка стоимости",
-    "Хорошая ли это компания по разумной цене, или рынок уже заложил слишком много ожиданий?",
-    `Market Cap / Капитализация: ${na}`,
-    `P/E / Цена к прибыли: ${na}`,
-    `Forward P/E / Будущий P/E: ${na}`,
-    `CAPE / Cyclically Adjusted P/E: ${na}`,
-    "CAPE сравнивает цену с усреднённой прибылью за длинный цикл. Полезен для проверки, не завышена ли оценка относительно нормализованной прибыли, но по отдельным компаниям часто доступен хуже, чем по индексам.",
-    `P/S / Цена к выручке: ${na}`,
-    `EV / EBITDA: ${na}`,
-    `PEG Ratio: ${na}`,
-    `P/B / Цена к балансовой стоимости: ${na}`,
-    "",
-    "3. Cash Flow / Денежный поток",
-    "Настоящая ли прибыль, и превращается ли бизнес в реальные свободные деньги?",
-    `Operating Cash Flow / OCF: ${na}`,
-    `Free Cash Flow / FCF: ${na}`,
-    `FCF Margin: ${na}`,
-    `FCF Yield: ${na}`,
-    "",
-    "4. Financial Health / Финансовое здоровье",
-    "Компания выдержит спад и сможет финансировать рост без разрушения баланса?",
-    `Debt-to-Equity / D/E: ${na}`,
-    `Total Cash / Денежные средства: ${na}`,
-    `Total Debt / Общий долг: ${na}`,
-    `Current Ratio: ${na}`,
-    `ROE / Рентабельность капитала: ${na}`,
-    `ROA / Рентабельность активов: ${na}`,
-    "",
-    "5. Forward Signals / Будущие сигналы",
-    "Куда меняются ожидания по компании?",
-    `Recommendation: ${na}`,
-    `Target Mean Price: ${na}`,
-    `Earnings Growth: ${na}`,
-    `Revenue Growth: ${na}`,
-    `Beta: ${na}`,
-    `Dividend Yield: ${na}`,
-    "",
-    "Технический контекст:",
-    `Движение: ${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`,
-    `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%`,
-    "",
-    "Короткая шпаргалка: Profitability отвечает на вопрос о качестве прибыли; Valuation — о цене; Cash Flow — о реальных деньгах; Financial Health — о прочности баланса; Forward Signals — об ожиданиях рынка.",
-  ];
   return lines.join("\n").trim();
 }
 
@@ -928,7 +1033,7 @@ async function fetchFundamentalData(ticker) {
     if (result) {
       return {
         ...result,
-        fundrepDataStatus: "Фундаментальные данные Yahoo Finance получены.",
+        fundrepDataStatus: "full",
       };
     }
     throw new Error("quoteSummary empty");
@@ -938,9 +1043,12 @@ async function fetchFundamentalData(ticker) {
         `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${safeTicker}`,
         "quote"
       );
-      const quote = data?.quoteResponse?.result?.[0] || {};
+      const quote = data?.quoteResponse?.result?.[0];
+      if (!quote || typeof quote !== "object") {
+        throw analysisError(`${ticker}: quote data is empty`, "NO_MARKET_DATA");
+      }
       return {
-        fundrepDataStatus: `quoteSummary недоступен: ${error.message || error}. Использованы доступные quote-данные.`,
+        fundrepDataStatus: "partial",
         price: {
           shortName: quote.shortName || quote.longName || ticker,
           regularMarketPrice: quote.regularMarketPrice,
@@ -969,26 +1077,29 @@ async function fetchFundamentalData(ticker) {
         },
       };
     } catch (fallbackError) {
-      return {
-        fundrepDataStatus: `Фундаментальные данные недоступны: ${fallbackError.message || fallbackError}.`,
-      };
+      const providerFailure = error.code === "DATA_PROVIDER_ERROR" || fallbackError.code === "DATA_PROVIDER_ERROR";
+      throw analysisError(
+        `${ticker}: fundamental providers failed (${error.message || error}; ${fallbackError.message || fallbackError})`,
+        providerFailure ? "DATA_PROVIDER_ERROR" : "NO_MARKET_DATA"
+      );
     }
   }
 }
 
-function fundRepHtml(ticker, result, fundamentals = {}) {
+function fundRepHtml(ticker, result, fundamentals = {}, language = "ru") {
+  const locale = normalizeReportLanguage(language);
   const row = result.rows[0];
   if (!row) {
-    return `<!doctype html><meta charset="utf-8"><title>FundRep ${escapeHtml(ticker)}</title><body><pre>${escapeHtml(reportErrorMessage("FundRep", ticker, result))}</pre></body>`;
+    return `<!doctype html><meta charset="utf-8"><title>FundRep ${escapeHtml(ticker)}</title><body><pre>${escapeHtml(reportErrorMessage("FundRep", ticker, result, locale))}</pre></body>`;
   }
 
-  const sections = fundRepSections(ticker, row, fundamentals);
+  const sections = localizeFundRepSections(fundRepSections(ticker, row, fundamentals), locale);
   const sectionHtml = sections.map((section) => `
     <section>
       <h2>${escapeHtml(section.title)}</h2>
       <p class="question">${escapeHtml(section.question)}</p>
       <table>
-        <thead><tr><th>Метрика</th><th>Значение</th><th>Объяснение</th></tr></thead>
+        <thead><tr><th>${escapeHtml(reportText(locale, "metric"))}</th><th>${escapeHtml(reportText(locale, "value"))}</th><th>${escapeHtml(reportText(locale, "explanation"))}</th></tr></thead>
         <tbody>
           ${section.metrics.map((metric) => `<tr><td>${escapeHtml(metric[0])}</td><td>${escapeHtml(metric[1])}</td><td>${escapeHtml(metric[2])}</td></tr>`).join("")}
         </tbody>
@@ -997,7 +1108,7 @@ function fundRepHtml(ticker, result, fundamentals = {}) {
   `).join("");
 
   return `<!doctype html>
-<html lang="ru">
+<html lang="${locale}" dir="${locale === "he" ? "rtl" : "ltr"}">
 <head>
   <meta charset="utf-8">
   <title>FundRep ${escapeHtml(ticker)}</title>
@@ -1066,16 +1177,16 @@ function fundRepHtml(ticker, result, fundamentals = {}) {
   </style>
 </head>
 <body>
-  <h1>FundRep: фундаментальный отчёт по ${escapeHtml(ticker)}</h1>
-  <p class="meta">Дата: ${escapeHtml(result.timestamp)} · ${escapeHtml(fundamentals.fundrepDataStatus || "Фундаментальные данные частично доступны.")} · Не является инвестиционной рекомендацией.</p>
+  <h1>FundRep: ${escapeHtml(reportText(locale, "fundTitle", { ticker }))}</h1>
+  <p class="meta">${escapeHtml(reportText(locale, "reportDate"))}: ${escapeHtml(result.timestamp)} · ${escapeHtml(fundamentalDataStatus(fundamentals.fundrepDataStatus, locale))} · ${escapeHtml(reportText(locale, "disclaimer"))}</p>
   ${sectionHtml}
-  <div class="note">Короткая шпаргалка: Profitability отвечает на вопрос о качестве прибыли; Valuation — о цене; Cash Flow — о реальных деньгах; Financial Health — о прочности баланса; Forward Signals — об ожиданиях рынка.</div>
+  <div class="note">${escapeHtml(reportText(locale, "quickGuide"))}</div>
 </body>
 </html>`;
 }
 
 function fundRepSections(ticker, row, data = {}) {
-  const na = "н/д";
+  const na = "-";
   const priceValue = metricValue(data, "price", "regularMarketPrice") ?? row.price;
   const currency = fmtMetric(metricValue(data, "price", "currency") || "USD");
   const price = `${fmtMetric(priceValue)} ${currency}`;
@@ -1087,114 +1198,124 @@ function fundRepSections(ticker, row, data = {}) {
   const fcfYield = numberOrNull(freeCashflow) != null && numberOrNull(marketCap) ? numberOrNull(freeCashflow) / numberOrNull(marketCap) : null;
   return [
     {
-      title: "1. Profitability / Прибыльность",
-      question: "Компания реально зарабатывает деньги и становится ли бизнес эффективнее?",
+      title: "profitability",
+      question: "profitability",
       metrics: [
-        ["Компания", fmtMetric(metricValue(data, "price", "shortName") || ticker), `Тикер: ${ticker}. Сектор: ${fmtMetric(metricValue(data, "assetProfile", "sector"))}. Индустрия: ${fmtMetric(metricValue(data, "assetProfile", "industry"))}.`],
-        ["Текущая цена", price, "Рыночная цена нужна как отправная точка для сравнения с фундаментальными метриками."],
-        ["Revenue Growth / Рост выручки", fmtPercent(metricValue(data, "financialData", "revenueGrowth")), "Показывает темп роста верхней строки. Ускорение роста обычно поддерживает оценку компании."],
-        ["Gross Margin / Валовая маржа", fmtPercent(metricValue(data, "financialData", "grossMargins")), "Показывает ценовую силу продукта и эффективность себестоимости."],
-        ["Operating Margin / Операционная маржа", fmtPercent(metricValue(data, "financialData", "operatingMargins")), "Показывает прибыльность основного бизнеса после операционных расходов."],
-        ["Net Margin / Чистая маржа", fmtPercent(metricValue(data, "financialData", "profitMargins")), "Показывает, сколько прибыли остаётся акционерам после всех расходов."],
-        ["EPS / Прибыль на акцию", fmtMetric(metricValue(data, "defaultKeyStatistics", "trailingEps")), "EPS показывает прибыль, приходящуюся на одну акцию."],
-        ["EBITDA", fmtMoney(metricValue(data, "financialData", "ebitda")), "Грубая оценка операционной денежной генерации до процентов, налогов и амортизации."],
+        ["Company", fmtMetric(metricValue(data, "price", "shortName") || ticker)],
+        ["Current price", price],
+        ["Revenue Growth", fmtPercent(metricValue(data, "financialData", "revenueGrowth"))],
+        ["Gross Margin", fmtPercent(metricValue(data, "financialData", "grossMargins"))],
+        ["Operating Margin", fmtPercent(metricValue(data, "financialData", "operatingMargins"))],
+        ["Net Margin", fmtPercent(metricValue(data, "financialData", "profitMargins"))],
+        ["EPS", fmtMetric(metricValue(data, "defaultKeyStatistics", "trailingEps"))],
+        ["EBITDA", fmtMoney(metricValue(data, "financialData", "ebitda"))],
       ],
     },
     {
-      title: "2. Valuation / Оценка стоимости",
-      question: "Хорошая ли это компания по разумной цене, или рынок уже заложил слишком много ожиданий?",
+      title: "valuation",
+      question: "valuation",
       metrics: [
-        ["Market Cap / Капитализация", fmtMoney(marketCap), "Размер компании на рынке. Важно сравнивать с выручкой, прибылью и денежным потоком."],
-        ["P/E / Цена к прибыли", fmtMetric(metricValue(data, "summaryDetail", "trailingPE")), "Показывает, сколько инвестор платит за доллар текущей прибыли."],
-        ["Forward P/E / Будущий P/E", fmtMetric(metricValue(data, "summaryDetail", "forwardPE")), "Использует ожидаемую прибыль и полезен для растущих компаний, но зависит от прогнозов."],
-        ["CAPE / Cyclically Adjusted P/E", na, "CAPE сравнивает цену с усреднённой прибылью за длинный цикл. Он помогает увидеть оценку относительно нормализованной прибыли, но для отдельных компаний часто доступен хуже, чем для индексов."],
-        ["P/S / Цена к выручке", fmtMetric(metricValue(data, "summaryDetail", "priceToSalesTrailing12Months")), "Особенно полезен для компаний, где прибыль пока нестабильна."],
-        ["EV / EBITDA", fmtMetric(metricValue(data, "defaultKeyStatistics", "enterpriseToEbitda")), "Сравнивает стоимость предприятия с EBITDA и учитывает долг."],
-        ["PEG Ratio", fmtMetric(metricValue(data, "defaultKeyStatistics", "pegRatio")), "Сравнивает P/E с темпом роста прибыли. Ниже 1 часто выглядит интереснее, но не является автоматическим сигналом."],
-        ["P/B / Цена к балансовой стоимости", fmtMetric(metricValue(data, "defaultKeyStatistics", "priceToBook")), "Полезно для банков, страховых и капиталоёмких бизнесов."],
+        ["Market Cap", fmtMoney(marketCap)],
+        ["P/E", fmtMetric(metricValue(data, "summaryDetail", "trailingPE"))],
+        ["Forward P/E", fmtMetric(metricValue(data, "summaryDetail", "forwardPE"))],
+        ["CAPE", na],
+        ["P/S", fmtMetric(metricValue(data, "summaryDetail", "priceToSalesTrailing12Months"))],
+        ["EV / EBITDA", fmtMetric(metricValue(data, "defaultKeyStatistics", "enterpriseToEbitda"))],
+        ["PEG Ratio", fmtMetric(metricValue(data, "defaultKeyStatistics", "pegRatio"))],
+        ["P/B", fmtMetric(metricValue(data, "defaultKeyStatistics", "priceToBook"))],
       ],
     },
     {
-      title: "3. Cash Flow / Денежный поток",
-      question: "Настоящая ли прибыль, и превращается ли бизнес в реальные свободные деньги?",
+      title: "cash_flow",
+      question: "cash_flow",
       metrics: [
-        ["Operating Cash Flow / OCF", fmtMoney(metricValue(data, "financialData", "operatingCashflow")), "Деньги, которые компания генерирует основной деятельностью."],
-        ["Free Cash Flow / FCF", fmtMoney(freeCashflow), "Деньги после капитальных расходов, доступные для buybacks, дивидендов, долга или роста."],
-        ["FCF Margin", fmtPercent(fcfMargin), "FCF margin = FCF / выручка. Если данных выручки недостаточно, показатель нужно досчитать из отчётности."],
-        ["FCF Yield", fmtPercent(fcfYield), "FCF yield = FCF / market cap. Помогает понять доходность свободного денежного потока относительно цены компании."],
+        ["Operating Cash Flow", fmtMoney(metricValue(data, "financialData", "operatingCashflow"))],
+        ["Free Cash Flow", fmtMoney(freeCashflow)],
+        ["FCF Margin", fmtPercent(fcfMargin)],
+        ["FCF Yield", fmtPercent(fcfYield)],
       ],
     },
     {
-      title: "4. Financial Health / Финансовое здоровье",
-      question: "Компания выдержит спад и сможет финансировать рост без разрушения баланса?",
+      title: "financial_health",
+      question: "financial_health",
       metrics: [
-        ["Debt-to-Equity / D/E", fmtMetric(metricValue(data, "financialData", "debtToEquity")), "Показывает финансовый рычаг и риск зависимости от долга."],
-        ["Total Cash / Денежные средства", fmtMoney(metricValue(data, "financialData", "totalCash")), "Запас ликвидности для кризиса, инвестиций, buybacks и погашения долга."],
-        ["Total Debt / Общий долг", fmtMoney(metricValue(data, "financialData", "totalDebt")), "Важно сравнивать с cash, EBITDA и денежным потоком."],
-        ["Current Ratio", fmtMetric(metricValue(data, "financialData", "currentRatio")), "Показывает способность закрывать ближайшие обязательства текущими активами."],
-        ["ROE / Рентабельность капитала", fmtPercent(metricValue(data, "financialData", "returnOnEquity")), "Показывает эффективность использования капитала акционеров."],
-        ["ROA / Рентабельность активов", fmtPercent(metricValue(data, "financialData", "returnOnAssets")), "Показывает эффективность использования всех активов компании."],
+        ["Debt-to-Equity", fmtMetric(metricValue(data, "financialData", "debtToEquity"))],
+        ["Total Cash", fmtMoney(metricValue(data, "financialData", "totalCash"))],
+        ["Total Debt", fmtMoney(metricValue(data, "financialData", "totalDebt"))],
+        ["Current Ratio", fmtMetric(metricValue(data, "financialData", "currentRatio"))],
+        ["ROE", fmtPercent(metricValue(data, "financialData", "returnOnEquity"))],
+        ["ROA", fmtPercent(metricValue(data, "financialData", "returnOnAssets"))],
       ],
     },
     {
-      title: "5. Forward Signals / Будущие сигналы",
-      question: "Куда меняются ожидания по компании?",
+      title: "forward_signals",
+      question: "forward_signals",
       metrics: [
-        ["Recommendation", fmtMetric(metricValue(data, "financialData", "recommendationKey")), "Сводная рекомендация аналитиков, если источник её предоставляет."],
-        ["Target Mean Price", fmtMetric(metricValue(data, "financialData", "targetMeanPrice")), "Средняя целевая цена аналитиков. Это ориентир ожиданий, а не гарантия."],
-        ["Earnings Growth", fmtPercent(metricValue(data, "financialData", "earningsGrowth")), "Рост прибыли поддерживает переоценку, если ожидания подтверждаются."],
-        ["Revenue Growth", fmtPercent(metricValue(data, "financialData", "revenueGrowth")), "Рост выручки показывает направление спроса на продукт или услугу."],
-        ["Beta", fmtMetric(metricValue(data, "summaryDetail", "beta")), "Показывает чувствительность акции к рынку. Выше 1 означает более высокую волатильность."],
-        ["Dividend Yield", fmtPercent(metricValue(data, "summaryDetail", "dividendYield")), "Доходность дивидендов важна для компаний, где часть инвестиционной идеи связана с выплатами."],
-        ["Технический контекст", `Движение: ${movement}`, `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, ATR14: ${valueOrDash(row.atr14)}, MMA150: ${valueOrDash(row.mma150)}, от MMA150: ${distanceText(row.mma150_distance_percent)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%.`],
+        ["Recommendation", fmtMetric(metricValue(data, "financialData", "recommendationKey"))],
+        ["Target Mean Price", fmtMetric(metricValue(data, "financialData", "targetMeanPrice"))],
+        ["Earnings Growth", fmtPercent(metricValue(data, "financialData", "earningsGrowth"))],
+        ["Revenue Growth", fmtPercent(metricValue(data, "financialData", "revenueGrowth"))],
+        ["Beta", fmtMetric(metricValue(data, "summaryDetail", "beta"))],
+        ["Dividend Yield", fmtPercent(metricValue(data, "summaryDetail", "dividendYield"))],
+        ["Technical context", movement],
       ],
     },
   ];
 }
 
-function promtRepMessage(ticker, result) {
+function localizeFundRepSections(sections, language) {
+  return sections.map((section, index) => ({
+    title: reportText(language, `fundSection${index + 1}`),
+    question: reportText(language, `fundQuestion${index + 1}`),
+    metrics: section.metrics.map(([label, value]) => [
+      fundMetricLabel(language, label),
+      value,
+      reportText(language, "metricExplanationGeneric"),
+    ]),
+  }));
+}
+
+function promtRepMessage(ticker, result, language = "ru") {
   const row = result.rows[0];
-  if (!row) return reportErrorMessage("PromtRep", ticker, result);
+  if (!row) return reportErrorMessage("PromtRep", ticker, result, language);
   return [
     `🧠 PromtRep ${ticker}`,
     "━━━━━━━━━━━━━━",
     "",
-    "Скопируй этот промт в Perplexity Finance:",
+    reportText(language, "promptIntro"),
     "",
-    `Подготовь профессиональный PDF-отчёт по тикеру ${ticker}.`,
-    "Структура отчёта:",
-    "1. Income Statement: выручка, маржа, прибыль, динамика и причины изменений.",
-    "2. Momentum: тренд цены, относительная сила, RSI, объём и ключевые уровни.",
-    "3. Valuation History: мультипликаторы, сравнение с историей и сектором.",
-    "   В Valuation History отдельно добавь CAPE / Cyclically Adjusted P/E: объясни метод расчёта, ограничения для отдельной компании и вывод по нормализованной прибыли.",
-    "4. Capital & Conviction: баланс, долги, buybacks, insider/institutional activity.",
+    reportText(language, "promptRequest", { ticker }),
+    `${reportText(language, "promptStructure")}:`,
+    `1. ${reportText(language, "prompt1")}`,
+    `2. ${reportText(language, "prompt2")}`,
+    `3. ${reportText(language, "prompt3")}`,
+    `4. ${reportText(language, "prompt4")}`,
     "",
-    "Текущие технические вводные:",
-    `Цена: ${row.price.toFixed(2)}`,
-    `Движение: ${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`,
+    `${reportText(language, "promptInputs")}:`,
+    `${reportText(language, "price")}: ${row.price.toFixed(2)}`,
+    `${reportText(language, "movement")}: ${row.change > 0 ? "+" : ""}${row.change.toFixed(2)} (${row.change_percent > 0 ? "+" : ""}${row.change_percent.toFixed(2)}%)`,
     `EMA200: ${valueOrDash(row.ema200)}, AVWAP: ${valueOrDash(row.avwap)}, RSI: ${valueOrDash(row.rsi14)}, ROC20: ${valueOrDash(row.roc20)}%`,
     "",
-    "Для каждого KPI объясни: что значит показатель, почему он изменился, на что влияет для инвестора и что отслеживать дальше. Итог должен выглядеть как современный аналитический dashboard с графиками, KPI-карточками и кратким инвестиционным выводом.",
+    reportText(language, "promptFinal"),
   ].join("\n").trim();
 }
 
-function reportErrorMessage(label, ticker, result) {
-  const error = result.errors[0]?.error || "не удалось получить данные";
-  return `⚠️ ${label} ${ticker}\n━━━━━━━━━━━━━━\n${error}`;
+function reportErrorMessage(label, ticker, result, language = "ru") {
+  return `⚠️ ${label} ${ticker}\n━━━━━━━━━━━━━━\n${reportText(language, "reportFailed")}`;
 }
 
-function telegramSignalMessage(signal) {
+function telegramSignalMessage(signal, language = "ru") {
   const icon = signal.side === "long" ? "📈" : "📉";
   return [
-    `${icon} Сигнал по ${signal.ticker}`,
+    `${icon} ${reportText(language, "signalFor", { ticker: signal.ticker })}`,
     "",
-    `Стратегия: ${signal.strategy}`,
-    `Цена: ${signal.price.toFixed(2)}`,
-    `Условие: ${signal.condition}`,
-    `Идея: ${signal.idea}`,
-    `Стоп: ${signal.stop.toFixed(2)}`,
-    `Цель: ${signal.target.toFixed(2)}`,
-    `Риск: ${signal.risk}%`,
+    `${reportText(language, "strategy")}: ${localizedStrategy(signal.strategy, language)}`,
+    `${reportText(language, "price")}: ${signal.price.toFixed(2)}`,
+    `${reportText(language, "condition")}: ${signal.condition}`,
+    `${reportText(language, "idea")}: ${signal.idea}`,
+    `${reportText(language, "stop")}: ${signal.stop.toFixed(2)}`,
+    `${reportText(language, "target")}: ${signal.target.toFixed(2)}`,
+    `${reportText(language, "risk")}: ${signal.risk}%`,
   ].join("\n");
 }
 
@@ -1207,7 +1328,7 @@ async function sendTelegram(env, chatId, text, bot = {}) {
     body: JSON.stringify({ chat_id: chatId, text }),
   });
   const data = await response.json();
-  if (!data.ok) throw new Error(data.description || "Telegram Ð½Ðµ Ð¿Ñ€Ð¸Ð½ÑÐ» ÑÐ¾Ð¾Ð±Ñ‰ÐµÐ½Ð¸Ðµ");
+  if (!data.ok) throw new Error(data.description || "Telegram не принял сообщение");
 }
 
 async function sendTelegramDocument(env, chatId, filename, content, caption = "", bot = {}) {
@@ -1287,11 +1408,36 @@ function validateContractPayload(payload) {
   }
   if (payload.bot && typeof payload.bot === "object") {
     if (payload.bot.token || payload.bot.telegramToken || payload.bot.botToken) {
-      errors.push(contractError("bot", "Do not send Telegram tokens in payload; use bot.tokenSecretName and Cloudflare secrets"));
+      errors.push(contractError("bot", "Do not send Telegram tokens in private premium API payload"));
+    }
+    if (payload.bot.tokenSecretName || payload.bot.token_secret_name) {
+      errors.push(contractError("bot.tokenSecretName", "Telegram bot token secrets are not allowed in private premium API", "telegram_bot_not_allowed"));
     }
   }
   if (payload.telegramToken || payload.botToken || payload.tokenSecret) {
     errors.push(contractError("telegram", "Do not send Telegram tokens in payload"));
+  }
+  if (payload.delivery && typeof payload.delivery === "object" && payload.delivery.sendToTelegram === true) {
+    errors.push(contractError("delivery.sendToTelegram", "Telegram delivery is not allowed in private premium API", "telegram_delivery_not_allowed"));
+  }
+  const forbiddenBusinessFields = [
+    "quota",
+    "quotaBalance",
+    "quotaDecision",
+    "chargeUnits",
+    "remainingUnits",
+    "tariff",
+    "tariffPlan",
+    "subscription",
+    "subscriptionState",
+    "userBalance",
+    "balance",
+    "billingLedger",
+  ];
+  for (const field of forbiddenBusinessFields) {
+    if (Object.prototype.hasOwnProperty.call(payload, field)) {
+      errors.push(contractError(field, "Do not send quota, balance, tariff, subscription, or billing data to scanner"));
+    }
   }
   if (payload.analysis && typeof payload.analysis === "object") {
     const rawStrategies = payload.analysis.strategies;
@@ -1311,7 +1457,19 @@ function validateContractPayload(payload) {
       errors.push(contractError("analysis.anchorBars", "anchorBars must be a positive integer candle count"));
     }
   }
+  const reportType = String(payload.reportType || payload.analysis?.reportType || "regular").trim().toLowerCase();
+  if (!["regular", "fundrep"].includes(reportType)) {
+    errors.push(contractError("reportType", "reportType must be regular or fundrep"));
+  }
+  const language = contractLanguageValue(payload);
+  if (!isSupportedReportLanguage(language)) {
+    errors.push(contractError("language", "Supported languages: ru, en, he", "unsupported_language"));
+  }
   return { errors };
+}
+
+function contractLanguageValue(payload) {
+  return payload.language ?? payload.analysis?.language ?? payload.locale ?? payload.news?.language ?? null;
 }
 
 function contractError(field, message, code = "invalid_contract") {
@@ -1353,14 +1511,105 @@ function contractFailedResponse(requestId, error) {
   };
 }
 
-function contractProcessedResponse(normalized, scannerResult, telegram) {
+function contractAccessRejectedResponse(normalized, accessChecks) {
+  const primary = accessChecks.find((access) => access.allowed === false) || accessChecks[0] || {};
+  const failureCode = primary.failureCode || null;
+  const failed = Boolean(failureCode);
   return {
     contractVersion: CONTRACT_VERSION,
     requestId: normalized.requestId,
-    status: "processed",
+    status: failed ? "failed" : "rejected",
+    report: null,
+    access: normalizeAccessChecks(accessChecks),
+    telegram: { sendToTelegram: false, delivered: false, chatId: null },
+    errors: [
+      contractError(
+        "access",
+        primary.reason || "Access or quota check rejected the request",
+        failureCode || primary.quotaDecision || "rejected_no_access"
+      ),
+    ],
+  };
+}
+
+function contractInvalidAccessDecisionResponse(normalized, accessChecks) {
+  return {
+    contractVersion: CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    status: "failed",
+    report: null,
+    access: normalizeAccessChecks(accessChecks),
+    telegram: { sendToTelegram: false, delivered: false, chatId: null },
+    errors: [contractError(
+      "access",
+      "forceRefresh cannot be combined with reportSource=cached_report",
+      "invalid_access_decision"
+    )],
+  };
+}
+
+function contractAccessFailureResponse(normalized, accessChecks, message, code) {
+  return {
+    contractVersion: CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    status: "failed",
+    report: null,
+    access: normalizeAccessChecks(accessChecks),
+    telegram: { sendToTelegram: false, delivered: false, chatId: null },
+    errors: [contractError("access", message, code)],
+  };
+}
+
+function contractCachedReportFailureResponse(normalized, accessChecks, missingTickers) {
+  const fundRep = normalized.reportType === "fundrep";
+  return {
+    contractVersion: CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    status: "failed",
+    report: null,
+    access: normalizeAccessChecks(accessChecks),
+    telegram: { sendToTelegram: false, delivered: false, chatId: null },
+    errors: [contractError(
+      "cache",
+      fundRep
+        ? `Fresh FundRep cache was promised but not found for: ${missingTickers.join(", ")}`
+        : `Fresh cached report was promised but not found for: ${missingTickers.join(", ")}`,
+      fundRep ? "fundrep_cache_not_found" : "cached_report_not_found"
+    )],
+  };
+}
+
+function contractHttpStatus(result = {}) {
+  if (result.status === "processed") return 200;
+  const errors = Array.isArray(result.errors) ? result.errors : [];
+  if (result.status === "rejected") {
+    if (errors.length && errors.every((error) => error.field === "access")) return 200;
+    if (errors.some((error) => error.field === "auth" || error.code === "authentication_failed")) return 403;
+    return 400;
+  }
+  if (result.status === "failed") {
+    if (errors.some((error) => ["failed_quota_service", "invalid_core_response", "stored_result_not_found"].includes(error.code))) return 503;
+    if (errors.some((error) => ["cached_report_not_found", "fundrep_cache_not_found", "invalid_access_decision"].includes(error.code))) return 503;
+    if (errors.some((error) => error.code === "data_provider_error")) return 502;
+    return 500;
+  }
+  return 500;
+}
+
+function contractProcessedResponse(normalized, scannerResult, telegram, accessChecks = []) {
+  const errors = normalizeContractScannerErrors(scannerResult.errors || []);
+  const hasScannerFailure = errors.some((error) => ["data_provider_error", "scanner_error"].includes(error.code));
+  return {
+    contractVersion: CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    status: hasScannerFailure ? "failed" : "processed",
     report: {
       analysisType: scannerResult.analysisType || "technical",
+      reportType: normalized.reportType,
+      generationVersion: normalized.generationVersion,
+      cacheStatus: scannerResult.cacheStatus || "miss",
       timeframe: scannerResult.timeframe,
+      language: normalized.language,
       risk: scannerResult.config?.risk ?? normalized.risk,
       anchorBars: scannerResult.config?.anchorBars ?? normalized.anchorBars,
       strategies: scannerResult.config?.strategies ?? normalized.strategies,
@@ -1370,10 +1619,42 @@ function contractProcessedResponse(normalized, scannerResult, telegram) {
       signalCount: countSignals(scannerResult.rows || []),
       orchestrator: scannerResult.orchestrator || null,
       generatedAt: scannerResult.timestamp || new Date().toISOString(),
+      ...(scannerResult.analysisType === "fundamental" ? {
+        fundamentalResults: (scannerResult.items || []).map((item) => ({
+          ticker: item.ticker,
+          status: item.status,
+          price: item.price,
+          indicators: item.indicators,
+          fundamentalSummary: item.fundamentalSummary,
+          dataSources: item.dataSources,
+          errors: item.errors,
+        })),
+      } : {}),
     },
+    access: normalizeAccessChecks(accessChecks),
     telegram,
-    errors: normalizeContractScannerErrors(scannerResult.errors || []),
+    errors,
   };
+}
+
+function normalizeAccessChecks(accessChecks = []) {
+  return accessChecks.map((access) => ({
+    contractVersion: access.contractVersion || CORE_ACCESS_CONTRACT_VERSION,
+    requestId: access.requestId || null,
+    ticker: access.ticker || null,
+    allowed: access.allowed === true,
+    chargeUnits: numberOrNull(access.chargeUnits),
+    quotaDecision: stringOrNull(access.quotaDecision),
+    cacheStatus: stringOrNull(access.cacheStatus),
+    reportSource: stringOrNull(access.reportSource),
+    remainingUnits: numberOrNull(access.remainingUnits),
+    reason: stringOrNull(access.reason),
+    cacheReceiptId: stringOrNull(access.cacheReceiptId),
+    cacheCommitStatus: stringOrNull(access.cacheCommitStatus),
+    requestCacheStatus: stringOrNull(access.requestCacheStatus),
+    requestCacheCreatedAt: stringOrNull(access.requestCacheCreatedAt),
+    requestCacheGenerationVersion: stringOrNull(access.requestCacheGenerationVersion),
+  }));
 }
 
 function normalizeContractScannerErrors(errors) {
@@ -1390,6 +1671,428 @@ function scannerErrorStatus(code) {
   if (normalized === "INSUFFICIENT_DATA" || normalized === "NO_MARKET_DATA") return "not_enough_data";
   if (normalized === "DATA_PROVIDER_ERROR") return "data_provider_error";
   return "scanner_error";
+}
+
+async function loadContractCachedTechnicalReports(env, normalized, accessChecks) {
+  const results = new Map();
+  const cachedTickers = accessChecks
+    .filter((access) => isCachedReportSource(access.reportSource))
+    .map((access) => access.ticker)
+    .filter(Boolean);
+  if (!cachedTickers.length) return { results, missing: [] };
+  if (normalized.reportType !== "regular") return { results, missing: cachedTickers };
+
+  const missing = [];
+  for (const ticker of cachedTickers) {
+    const cached = await getAnalysisCache(env, technicalReportCacheKey(normalized, ticker));
+    if (cached) results.set(ticker, cached);
+    else missing.push(ticker);
+  }
+  return { results, missing };
+}
+
+async function loadContractCachedFundRepReports(env, normalized, accessChecks) {
+  const results = new Map();
+  const cachedTickers = accessChecks
+    .filter((access) => isCachedReportSource(access.reportSource))
+    .map((access) => access.ticker)
+    .filter(Boolean);
+  const missing = [];
+  for (const ticker of cachedTickers) {
+    const cached = await getAnalysisCache(env, fundRepReportCacheKey(normalized, ticker));
+    if (isValidCachedFundRep(cached, ticker)) results.set(ticker, cached);
+    else missing.push(ticker);
+  }
+  return { results, missing };
+}
+
+async function cacheContractTechnicalReports(env, normalized, scannerResult, tickers) {
+  const saved = new Map();
+  for (const ticker of tickers) {
+    const row = (scannerResult.rows || []).find((item) => item.ticker === ticker);
+    if (!row) continue;
+    const errors = (scannerResult.errors || []).filter((error) => error.ticker === ticker);
+    const items = (scannerResult.items || []).filter((item) => item.ticker === ticker);
+    const payload = {
+      ...scannerResult,
+      rows: [row],
+      errors,
+      items,
+      orchestrator: {
+        ...(scannerResult.orchestrator || {}),
+        status: "technical_report_cache",
+        cacheHit: false,
+      },
+    };
+    const cacheWrite = await setAnalysisCache(
+      env,
+      technicalReportCacheKey(normalized, ticker),
+      "technical_report",
+      payload,
+      TECHNICAL_REPORT_CACHE_TTL_SECONDS
+    );
+    saved.set(ticker, cacheWrite);
+  }
+  return saved;
+}
+
+async function cacheContractFundRepReports(env, normalized, scannerResult, tickers) {
+  const saved = new Map();
+  for (const ticker of tickers) {
+    const item = (scannerResult.items || []).find((candidate) => candidate.ticker === ticker);
+    const fundamentals = scannerResult.fundamentalsByTicker?.[ticker];
+    if (!item?.fundamentalSummary || item.errors?.length || !fundamentals || !hasFundamentalSummary(item.fundamentalSummary)) continue;
+    const row = (scannerResult.rows || []).find((candidate) => candidate.ticker === ticker);
+    const payload = {
+      timestamp: scannerResult.timestamp,
+      timeframe: scannerResult.timeframe,
+      analysisType: "fundamental",
+      rows: row ? [row] : [],
+      errors: [],
+      items: [item],
+      config: scannerResult.config,
+      fundamentalsByTicker: { [ticker]: fundamentals },
+      orchestrator: { status: "fundrep_report_cache", cacheHit: false },
+    };
+    const cacheWrite = await setAnalysisCache(
+      env,
+      fundRepReportCacheKey(normalized, ticker),
+      "fundrep_report",
+      payload,
+      FUNDREP_REPORT_CACHE_TTL_SECONDS
+    );
+    saved.set(ticker, cacheWrite);
+  }
+  return saved;
+}
+
+function technicalReportCacheKey(normalized, ticker) {
+  const language = normalized.language || "default";
+  const generationVersion = normalized.generationVersion || DEFAULT_GENERATION_VERSION;
+  return `technical-report:${ticker}:${normalized.reportType}:${language}:${generationVersion}`;
+}
+
+function fundRepReportCacheKey(normalized, ticker) {
+  const language = normalized.language || "ru";
+  const generationVersion = normalized.generationVersion || DEFAULT_GENERATION_VERSION;
+  return `fundrep-report:${ticker}:fundrep:${language}:${generationVersion}`;
+}
+
+function isValidCachedFundRep(cached, ticker) {
+  if (!cached || cached.analysisType !== "fundamental" || cached.errors?.length) return false;
+  const item = (cached.items || []).find((candidate) => candidate.ticker === ticker);
+  return Boolean(item?.fundamentalSummary && hasFundamentalSummary(item.fundamentalSummary));
+}
+
+function mergeContractScannerResults(normalized, freshResult, cachedResults) {
+  const cached = [...cachedResults.values()];
+  if (!cached.length) return freshResult;
+  const parts = freshResult ? [freshResult, ...cached] : cached;
+  const tickerOrder = new Map(normalized.tickers.map((ticker, index) => [ticker.symbol, index]));
+  const byTicker = (left, right) => (tickerOrder.get(left.ticker) ?? 999) - (tickerOrder.get(right.ticker) ?? 999);
+  const rows = parts.flatMap((part) => part.rows || []).sort(byTicker);
+  const errors = parts.flatMap((part) => part.errors || []).sort(byTicker);
+  const items = parts.flatMap((part) => part.items || [])
+    .map((item) => ({ ...item, requestId: normalized.requestId }))
+    .sort(byTicker);
+  const fundamentalsByTicker = Object.assign({}, ...parts.map((part) => part.fundamentalsByTicker || {}));
+  const analysisType = normalized.reportType === "fundrep" ? "fundamental" : "technical";
+  return {
+    ...(freshResult || cached[0]),
+    requestId: normalized.requestId,
+    timestamp: freshResult?.timestamp || cached[0]?.timestamp || new Date().toISOString(),
+    analysisType,
+    config: freshResult?.config || cached[0]?.config || normalizeAnalysisConfig(normalized),
+    rows,
+    errors,
+    items,
+    fundamentalsByTicker,
+    orchestrator: {
+      status: freshResult ? "mixed_cache" : "technical_report_cache_hit",
+      cacheHit: !freshResult,
+      cachedTickers: [...cachedResults.keys()],
+    },
+  };
+}
+function contractCacheStatus(normalized, freshCount, cachedCount) {
+  if (freshCount > 0 && cachedCount > 0) return "mixed";
+  if (cachedCount > 0) return "hit";
+  if (normalized.forceRefresh) return "refreshed";
+  return "miss";
+}
+
+function isCachedReportSource(value) {
+  return ["cache", "cached_report", "own_repeat"].includes(String(value || "").trim().toLowerCase());
+}
+
+function isOwnRepeatDecision(access) {
+  return String(access?.reportSource || "").toLowerCase() === "own_repeat" ||
+    ["own_repeat", "own_repeat_fundrep"].includes(String(access?.quotaDecision || "").toLowerCase());
+}
+
+async function checkContractAccessForTickers(env, normalized, origin = "-", country = "-", existingResult = null) {
+  const endpoint = accessCheckUrl(env);
+  const keyId = String(env.CORE_HMAC_KEY_ID || "").trim();
+  const secret = String(env.CORE_HMAC_SECRET || "").trim();
+  if (!endpoint || !coreAccessBinding(env) || !keyId || secret.length < 32) {
+    return normalized.tickers.map((ticker) => accessFailedDecision(normalized, ticker.symbol, "Access check is not configured"));
+  }
+
+  const checks = [];
+  for (const ticker of normalized.tickers) {
+    try {
+      const cacheHint = existingAccessCacheHint(existingResult, ticker.symbol) || await contractCacheHint(env, normalized, ticker.symbol);
+      const body = JSON.stringify(accessCheckRequest(normalized, ticker.symbol, cacheHint));
+      const headers = await coreHmacHeaders("POST", endpoint, body, keyId, secret);
+      const response = await coreAccessFetch(env, endpoint, {
+        method: "POST",
+        headers,
+        body,
+        signal: AbortSignal.timeout(5000),
+      });
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+      if (!response.ok || !data || typeof data !== "object") {
+        checks.push(accessFailedDecision(normalized, ticker.symbol, `Access check HTTP ${response.status}`));
+        continue;
+      }
+      checks.push(normalizeAccessCheckResponse(data, normalized, ticker.symbol, cacheHint));
+    } catch (error) {
+      checks.push(accessFailedDecision(normalized, ticker.symbol, "Core access check unavailable"));
+    }
+  }
+
+  const failed = checks.find((check) => check.failureCode);
+  if (failed) {
+    await addLog(env, origin, "Access check", normalized.tickers.map((ticker) => ticker.symbol).join(", "), "error", failed.failureCode, country);
+  }
+  return checks;
+}
+
+function isProduction(env) {
+  return ["production", "prod"].includes(String(env.APP_ENV || "").trim().toLowerCase());
+}
+
+function coreAccessBinding(env) {
+  const binding = env.CORE_SERVICE;
+  return binding && typeof binding.fetch === "function" ? binding : null;
+}
+
+function coreAccessFetchUrl(endpoint) {
+  const url = new URL(endpoint);
+  return new URL(`${url.pathname}${url.search}`, "https://core.internal").toString();
+}
+
+function coreAccessMode(env) {
+  return coreAccessBinding(env) ? "service_binding" : "not_configured";
+}
+
+async function coreAccessFetch(env, endpoint, init) {
+  const binding = coreAccessBinding(env);
+  if (!binding) throw new Error("CORE_SERVICE binding is not configured");
+  return binding.fetch(new Request(coreAccessFetchUrl(endpoint), init));
+}
+function accessCheckUrl(env) {
+  const explicit = String(env.ACCESS_CHECK_URL || "").trim();
+  if (explicit) return explicit;
+  const base = String(env.MARKET_SIGNAL_AI_BOT_URL || "").trim().replace(/\/+$/, "");
+  return base ? `${base}${ACCESS_CHECK_PATH}` : `https://core.internal${ACCESS_CHECK_PATH}`;
+}
+
+function accessCheckRequest(normalized, ticker, cacheHint) {
+  return {
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    userId: normalized.userId,
+    chatId: normalized.chatId || null,
+    ticker,
+    reportType: normalized.reportType,
+    generationVersion: normalized.generationVersion,
+    cacheStatus: cacheHint.cacheStatus,
+    cacheCreatedAt: cacheHint.cacheCreatedAt,
+    cacheGenerationVersion: cacheHint.cacheGenerationVersion,
+    forceRefresh: normalized.forceRefresh,
+    language: normalized.language,
+  };
+}
+
+function normalizeAccessCheckResponse(data, normalized, ticker, cacheHint) {
+  if (data.contractVersion !== CORE_ACCESS_CONTRACT_VERSION || data.requestId !== normalized.requestId || typeof data.allowed !== "boolean") {
+    return accessFailedDecision(normalized, ticker, "Invalid Core response", "invalid_core_response");
+  }
+  const reportSource = stringOrNull(data.reportSource);
+  const quotaDecision = stringOrNull(data.quotaDecision) || (data.allowed === true ? "allowed" : "rejected_no_access");
+  const cacheReceiptId = stringOrNull(data.cacheReceiptId);
+  if (data.allowed && requiresCacheReceipt(quotaDecision) && !cacheReceiptId) {
+    return accessFailedDecision(normalized, ticker, "Core did not return cacheReceiptId for new/refresh decision", "invalid_core_response");
+  }
+  return {
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
+    requestId: data.requestId || normalized.requestId,
+    ticker,
+    allowed: data.allowed === true,
+    chargeUnits: numberOrNull(data.chargeUnits),
+    quotaDecision,
+    cacheStatus: stringOrNull(data.cacheStatus),
+    reportSource,
+    remainingUnits: numberOrNull(data.remainingUnits),
+    reason: stringOrNull(data.reason) || (data.allowed === true ? "Allowed" : "Rejected"),
+    cacheReceiptId,
+    requestCacheStatus: cacheHint.cacheStatus,
+    requestCacheCreatedAt: cacheHint.cacheCreatedAt,
+    requestCacheGenerationVersion: cacheHint.cacheGenerationVersion,
+    cacheCommitStatus: null,
+    failureCode: null,
+  };
+}
+
+function requiresCacheReceipt(quotaDecision) {
+  return /^(new|refresh)_(regular|fundrep)$/.test(String(quotaDecision || "").toLowerCase());
+}
+
+function existingAccessCacheHint(existingResult, ticker) {
+  const access = (existingResult?.access || []).find((item) => item.ticker === ticker);
+  if (!access || !["hit", "miss"].includes(access.requestCacheStatus)) return null;
+  return {
+    cacheStatus: access.requestCacheStatus,
+    cacheCreatedAt: stringOrNull(access.requestCacheCreatedAt),
+    cacheGenerationVersion: stringOrNull(access.requestCacheGenerationVersion),
+  };
+}
+
+async function contractCacheHint(env, normalized, ticker) {
+  const cacheKey = normalized.reportType === "fundrep"
+    ? fundRepReportCacheKey(normalized, ticker)
+    : technicalReportCacheKey(normalized, ticker);
+  const entry = await getAnalysisCacheEntry(env, cacheKey);
+  const valid = normalized.reportType === "fundrep"
+    ? isValidCachedFundRep(entry?.payload, ticker)
+    : Boolean(entry?.payload?.rows?.some((row) => row.ticker === ticker));
+  if (!entry || !valid) return { cacheStatus: "miss", cacheCreatedAt: null, cacheGenerationVersion: null };
+  return {
+    cacheStatus: "hit",
+    cacheCreatedAt: entry.createdAt,
+    cacheGenerationVersion: normalized.generationVersion,
+  };
+}
+
+function accessFailedDecision(normalized, ticker, reason, failureCode = "failed_quota_service") {
+  return {
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    ticker,
+    allowed: false,
+    chargeUnits: null,
+    quotaDecision: failureCode,
+    cacheStatus: null,
+    reportSource: null,
+    remainingUnits: null,
+    reason,
+    cacheReceiptId: null,
+    failureCode,
+  };
+}
+
+async function coreHmacHeaders(method, endpoint, body, keyId, secret) {
+  const url = new URL(endpoint);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const requestId = `scanner_${crypto.randomUUID()}`;
+  const bodyHash = await sha256Hex(body);
+  const canonical = `${timestamp}.${keyId}.${requestId}.${method.toUpperCase()}.${url.pathname}.${canonicalQuery(url.searchParams)}.${bodyHash}`;
+  const signature = await hmacHex(secret, canonical);
+  return {
+    "Content-Type": "application/json",
+    "X-Key-Id": keyId,
+    "X-Request-Id": requestId,
+    "X-Timestamp": timestamp,
+    "X-Signature": `sha256=${signature}`,
+  };
+}
+
+async function commitContractCacheReceipts(env, normalized, accessChecks, savedReports, origin, country) {
+  for (const access of accessChecks) {
+    if (!requiresCacheReceipt(access.quotaDecision)) continue;
+    const saved = savedReports.get(access.ticker);
+    if (!saved || !access.cacheReceiptId) continue;
+    const commit = await commitCoreCacheReceipt(env, normalized, access, saved.resultDigest);
+    access.cacheCommitStatus = commit.ok ? "committed" : "failed";
+    if (!commit.ok) {
+      await addLog(
+        env,
+        origin,
+        "Core cache commit",
+        access.ticker,
+        "error",
+        `request=${normalized.requestId}; code=${commit.code}`,
+        country
+      );
+    }
+  }
+}
+
+async function commitCoreCacheReceipt(env, normalized, access, resultDigest) {
+  const accessEndpoint = accessCheckUrl(env);
+  const endpoint = accessEndpoint ? new URL("/api/internal/access/cache/commit", accessEndpoint).toString() : "";
+  const keyId = String(env.CORE_HMAC_KEY_ID || "").trim();
+  const secret = String(env.CORE_HMAC_SECRET || "").trim();
+  if (!endpoint || !coreAccessBinding(env) || !keyId || secret.length < 32) return { ok: false, code: "cache_commit_not_configured" };
+  const body = JSON.stringify({
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
+    cacheReceiptId: access.cacheReceiptId,
+    requestId: normalized.requestId,
+    ticker: access.ticker,
+    reportType: normalized.reportType,
+    generationVersion: normalized.generationVersion,
+    language: normalized.language,
+    resultDigest,
+  });
+  let lastCode = "cache_commit_unavailable";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const headers = await coreHmacHeaders("POST", endpoint, body, keyId, secret);
+      const response = await coreAccessFetch(env, endpoint, { method: "POST", headers, body, signal: AbortSignal.timeout(5000) });
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+      if (response.ok && data?.contractVersion === CORE_ACCESS_CONTRACT_VERSION && data.committed === true) {
+        return { ok: true, cacheEntryId: stringOrNull(data.cacheEntryId), expiresAt: stringOrNull(data.expiresAt) };
+      }
+      lastCode = stringOrNull(data?.error) || `cache_commit_http_${response.status}`;
+      if (response.status < 500) break;
+    } catch {
+      lastCode = "cache_commit_unavailable";
+    }
+  }
+  return { ok: false, code: lastCode };
+}
+
+function canonicalQuery(searchParams) {
+  return [...searchParams.entries()]
+    .sort(([leftKey, leftValue], [rightKey, rightValue]) => leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue))
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+async function hmacHex(secret, value) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return bytesToHex(new Uint8Array(signature));
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function normalizeExternalPayload(payload, env) {
@@ -1415,8 +2118,13 @@ function normalizeExternalPayload(payload, env) {
       tokenSecretName: stringOrNull(bot.tokenSecretName || bot.token_secret_name),
     },
     chatId: extractReplyChatId(payload, env),
+    userId: stringOrNull(payload.userId || payload.user_id || payload.telegramUserId || payload.user?.id),
     news: normalizeNews(payload.news),
     tickers,
+    reportType: String(payload.reportType || analysis.reportType || "regular").trim().toLowerCase(),
+    generationVersion: stringOrNull(payload.generationVersion || analysis.generationVersion || env.REPORT_GENERATION_VERSION) || DEFAULT_GENERATION_VERSION,
+    forceRefresh: payload.forceRefresh === true || analysis.forceRefresh === true,
+    language: normalizeLanguage(contractLanguageValue(payload)),
     timeframe: normalizeAnalysisConfig({ timeframe: analysis.timeframe || payload.timeframe || env.DEFAULT_TIMEFRAME || DEFAULT_TIMEFRAME }).timeframe,
     strategies: normalizeAnalysisConfig({ strategies: analysis.strategies || payload.strategies || env.DEFAULT_STRATEGIES || DEFAULT_STRATEGIES }).strategies,
     risk: normalizeAnalysisConfig({ risk: analysis.risk || payload.risk || env.DEFAULT_RISK || 1 }).risk,
@@ -1427,6 +2135,21 @@ function normalizeExternalPayload(payload, env) {
       async: delivery.async === true || payload.async === true,
     },
   };
+}
+
+function normalizeContractPayload(payload, env) {
+  const normalized = normalizeExternalPayload(payload, env);
+  normalized.chatId = null;
+  normalized.bot = {};
+  normalized.delivery = {
+    ...normalized.delivery,
+    sendToTelegram: false,
+  };
+  return normalized;
+}
+
+function normalizeLanguage(value) {
+  return normalizeReportLanguage(value);
 }
 
 function normalizeNews(news) {
@@ -1468,6 +2191,7 @@ function parseTickerDetails(value) {
 }
 
 function newsMessage(normalized) {
+  const language = normalized.language;
   const news = normalized.news;
   const country = normalized.country?.name || normalized.country?.iso2 || "-";
   const tickers = normalized.tickers.map((ticker) => {
@@ -1475,17 +2199,17 @@ function newsMessage(normalized) {
     return `${ticker.symbol}${suffix}`;
   }).join(", ");
   return [
-    "Market news",
+    reportText(language, "marketNews"),
     "--------------",
-    `Country: ${country}`,
-    news.source ? `Source: ${news.source}` : "",
-    news.publishedAt ? `Published: ${news.publishedAt}` : "",
+    `${reportText(language, "country")}: ${country}`,
+    news.source ? `${reportText(language, "source")}: ${news.source}` : "",
+    news.publishedAt ? `${reportText(language, "published")}: ${news.publishedAt}` : "",
     "",
     news.title,
     news.summary ? `\n${news.summary}` : "",
     news.url ? `\n${news.url}` : "",
     "",
-    `Tickers: ${tickers || "-"}`,
+    `${reportText(language, "tickers")}: ${tickers || "-"}`,
   ].filter((line) => line !== "").join("\n").trim();
 }
 
@@ -1729,10 +2453,23 @@ async function setContractResult(env, requestId, response) {
 }
 
 async function getAnalysisCache(env, cacheKey) {
-  if (!env.DB) return null;
+  const entry = await getAnalysisCacheEntry(env, cacheKey);
+  return entry?.payload ?? null;
+}
+
+async function getAnalysisCacheEntry(env, cacheKey) {
+  if (!env.DB) {
+    const cached = fallbackAnalysisCache.get(cacheKey);
+    if (!cached) return null;
+    if (cached.expiresAt <= Date.now()) {
+      fallbackAnalysisCache.delete(cacheKey);
+      return null;
+    }
+    return { payload: cached.payload, createdAt: new Date(cached.createdAt).toISOString(), expiresAt: new Date(cached.expiresAt).toISOString() };
+  }
   await ensureOrchestratorTables(env);
   const row = await env.DB.prepare(
-    "SELECT payload_json, expires_at FROM analysis_cache WHERE cache_key = ?"
+    "SELECT payload_json, created_at, expires_at FROM analysis_cache WHERE cache_key = ?"
   ).bind(cacheKey).first();
   if (!row) return null;
   if (new Date(row.expires_at).getTime() <= Date.now()) {
@@ -1740,22 +2477,29 @@ async function getAnalysisCache(env, cacheKey) {
     return null;
   }
   try {
-    return JSON.parse(row.payload_json);
+    return { payload: JSON.parse(row.payload_json), createdAt: row.created_at, expiresAt: row.expires_at };
   } catch {
     return null;
   }
 }
 
 async function setAnalysisCache(env, cacheKey, kind, payload, ttlSeconds) {
-  if (!env.DB) return;
+  const createdAtMs = Date.now();
+  const createdAt = new Date(createdAtMs).toISOString();
+  const expiresAt = new Date(createdAtMs + ttlSeconds * 1000).toISOString();
+  const payloadJson = JSON.stringify(payload);
+  if (!env.DB) {
+    fallbackAnalysisCache.set(cacheKey, { kind, payload, createdAt: createdAtMs, expiresAt: createdAtMs + ttlSeconds * 1000 });
+    return { payload, createdAt, expiresAt, resultDigest: await sha256Hex(payloadJson) };
+  }
   await ensureOrchestratorTables(env);
-  const now = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
   await env.DB.prepare(
     `INSERT INTO analysis_cache (cache_key, kind, payload_json, expires_at, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(cache_key) DO UPDATE SET kind=excluded.kind, payload_json=excluded.payload_json, expires_at=excluded.expires_at, updated_at=excluded.updated_at`
-  ).bind(cacheKey, kind, JSON.stringify(payload), expiresAt, now, now).run();
+     ON CONFLICT(cache_key) DO UPDATE SET kind=excluded.kind, payload_json=excluded.payload_json,
+       expires_at=excluded.expires_at, created_at=excluded.created_at, updated_at=excluded.updated_at`
+  ).bind(cacheKey, kind, payloadJson, expiresAt, createdAt, createdAt).run();
+  return { payload, createdAt, expiresAt, resultDigest: await sha256Hex(payloadJson) };
 }
 
 async function recordAnalysisTask(env, task) {
@@ -2077,8 +2821,8 @@ function isValidTicker(ticker) {
 }
 
 function tickerValidationError(ticker) {
-  if (ticker.length > MAX_TICKER_LENGTH) return `ÑÐ»Ð¸ÑˆÐºÐ¾Ð¼ Ð´Ð»Ð¸Ð½Ð½Ñ‹Ð¹ Ñ‚Ð¸ÐºÐµÑ€, Ð¼Ð°ÐºÑÐ¸Ð¼ÑƒÐ¼ ${MAX_TICKER_LENGTH} ÑÐ¸Ð¼Ð²Ð¾Ð»Ð¾Ð²`;
-  return "Ð½ÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ñ‚Ð¸ÐºÐµÑ€";
+  if (ticker.length > MAX_TICKER_LENGTH) return `слишком длинный тикер, максимум ${MAX_TICKER_LENGTH} символов`;
+  return "некорректный тикер";
 }
 
 function normalizeStrategies(value) {
@@ -2128,11 +2872,11 @@ function assertServiceToken(request, env) {
 
 function assertWebhookToken(request, env, payload) {
   const expected = String(env.WEBHOOK_TOKEN || "").trim();
-  if (!expected) throw httpError("WEBHOOK_TOKEN Ð½Ðµ Ð·Ð°Ð´Ð°Ð½", 500);
+  if (!expected) throw httpError("WEBHOOK_TOKEN не задан", 500);
   const authorization = request.headers.get("Authorization") || "";
   const bearer = authorization.toLowerCase().startsWith("bearer ") ? authorization.slice(7).trim() : "";
   const provided = request.headers.get("X-Scanner-Token") || bearer || payload.token || payload.apiToken || "";
-  if (provided !== expected) throw httpError("ÐÐµÐ²ÐµÑ€Ð½Ñ‹Ð¹ Webhook/API token", 403);
+  if (provided !== expected) throw httpError("Неверный Webhook/API token", 403);
 }
 
 function assertTelegramWebhookSecret(request, env) {
@@ -2216,11 +2960,11 @@ function numberOrNull(value) {
 }
 
 function fmtMetric(value) {
-  if (value == null || value === "" || Number.isNaN(value)) return "н/д";
+  if (value == null || value === "" || Number.isNaN(value)) return "-";
   if (value && typeof value === "object") {
     if ("raw" in value) return fmtMetric(value.raw);
     if ("fmt" in value) return String(value.fmt);
-    return "н/д";
+    return "-";
   }
   if (typeof value === "number") return round(value, 2).toString();
   return String(value);
@@ -2247,11 +2991,24 @@ function valueOrDash(value) {
   return value == null || Number.isNaN(value) ? "-" : value;
 }
 
-function marketContext(row) {
-  const trend = row.ema200 == null ? "EMA200 недоступна" : row.price > row.ema200 ? "цена выше EMA200" : row.price < row.ema200 ? "цена ниже EMA200" : "цена около EMA200";
-  const meanDistance = row.mma150_distance_percent == null ? "расстояние от MMA150 недоступно" : `расстояние от MMA150: ${distanceText(row.mma150_distance_percent)}`;
-  const momentum = row.rsi14 >= 55 ? "положительный momentum" : row.rsi14 <= 45 ? "отрицательный momentum" : "нейтральный momentum";
+function marketContext(row, language = "ru") {
+  const trend = row.ema200 == null ? `EMA200 ${reportText(language, "unavailable")}` : row.price > row.ema200 ? reportText(language, "trendAbove") : row.price < row.ema200 ? reportText(language, "trendBelow") : reportText(language, "trendNear");
+  const meanDistance = row.mma150_distance_percent == null ? `MMA150 ${reportText(language, "unavailable")}` : reportText(language, "mmaDistance", { distance: distanceText(row.mma150_distance_percent) });
+  const momentum = row.rsi14 >= 55 ? reportText(language, "momentumPositive") : row.rsi14 <= 45 ? reportText(language, "momentumNegative") : reportText(language, "momentumNeutral");
   return `${trend}; ${meanDistance}; RSI ${valueOrDash(row.rsi14)} (${momentum}); ATR14 ${valueOrDash(row.atr14)}.`;
+}
+
+function localizedStatus(status, language = "ru") {
+  return reportText(language, `status_${status}`);
+}
+
+function localizedSide(side, language = "ru") {
+  return reportText(language, `side_${side}`);
+}
+
+function localizedStrategy(strategy, language = "ru") {
+  const key = String(strategy || "").replace(/[^A-Za-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  return reportText(language, `strategy_${key}`);
 }
 
 function distanceText(value) {
@@ -2269,6 +3026,8 @@ function normalizeAnalysisConfig(config = {}) {
     strategies: strategies.length ? strategies : DEFAULT_STRATEGIES,
     risk: Number.isFinite(risk) && risk > 0 ? risk : 1,
     anchorBars: Number.isFinite(anchorBars) && anchorBars > 0 ? Math.round(anchorBars) : 120,
+    language: normalizeLanguage(config.language),
+    generationVersion: stringOrNull(config.generationVersion) || DEFAULT_GENERATION_VERSION,
   };
 }
 

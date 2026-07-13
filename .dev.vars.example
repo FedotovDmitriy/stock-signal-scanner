@@ -2,3 +2,6 @@ TELEGRAM_BOT_TOKEN=123456:ABC
 TELEGRAM_BOT_TOKEN_US_STOCKS_BOT=123456:ABC
 TELEGRAM_CHAT_ID=123456789
 WEBHOOK_TOKEN=change-me
+ACCESS_CHECK_URL=https://market-signal-ai-bot-dev.fnemoy.workers.dev/api/internal/access/check
+CORE_HMAC_KEY_ID=scanner-dev-v2
+CORE_HMAC_SECRET=replace-with-at-least-32-random-bytes
