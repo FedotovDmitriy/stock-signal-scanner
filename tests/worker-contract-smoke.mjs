@@ -165,6 +165,9 @@ async function withMockFetch(testFn, options = {}) {
   const telegramMessages = [];
   const businessDecisions = new Map();
   const committedReceipts = new Map();
+  const receiptOwners = new Map();
+  const ownedReports = new Map();
+  const sharedReports = new Map();
 
   async function verifyCoreHmac(init, pathname) {
     const rawBody = String(init.body || "");
@@ -205,20 +208,50 @@ async function withMockFetch(testFn, options = {}) {
       const request = JSON.parse(verified.rawBody || "{}");
       accessRequests.push(request);
       const businessKey = `${request.requestId}:${request.ticker}`;
+      const ownershipKey = `${request.userId || ""}:${request.ticker}:${request.reportType}:${request.generationVersion}:${request.language}`;
+      const reportKey = `${request.ticker}:${request.reportType}:${request.generationVersion}:${request.language}`;
       const requestHash = JSON.stringify(request);
       const previous = businessDecisions.get(businessKey);
       if (previous) {
         if (previous.requestHash !== requestHash) {
           return Response.json({ contractVersion: "1.1", requestId: request.requestId, allowed: false, reason: "invalid_request" }, { status: 400 });
         }
-        return Response.json({
-          ...previous.decision,
-          chargeUnits: 0,
-          quotaDecision: request.reportType === "fundrep" ? "own_repeat_fundrep" : "own_repeat",
-          reportSource: "own_repeat",
-        });
+        return Response.json(previous.decision);
       }
       const accessBody = typeof options.accessBody === "function" ? options.accessBody(request) : options.accessBody;
+      const owned = ownedReports.get(ownershipKey);
+      if (!accessBody && owned && request.cacheStatus === "hit") {
+        const decision = {
+          contractVersion: "1.1",
+          requestId: request.requestId,
+          allowed: true,
+          chargeUnits: 0,
+          quotaDecision: request.reportType === "fundrep" ? "own_repeat_fundrep" : "own_repeat",
+          cacheStatus: "hit",
+          reportSource: "own_repeat",
+          remainingUnits: 10,
+          reason: "Own repeat",
+          cacheReceiptId: null,
+        };
+        businessDecisions.set(businessKey, { requestHash, decision });
+        return Response.json(decision);
+      }
+      if (!accessBody && sharedReports.has(reportKey) && request.cacheStatus === "hit") {
+        const decision = {
+          contractVersion: "1.1",
+          requestId: request.requestId,
+          allowed: true,
+          chargeUnits: 0,
+          quotaDecision: request.reportType === "fundrep" ? "cached_fundrep" : "cached_regular",
+          cacheStatus: "hit",
+          reportSource: "cached_report",
+          remainingUnits: 10,
+          reason: "Shared cached report",
+          cacheReceiptId: null,
+        };
+        businessDecisions.set(businessKey, { requestHash, decision });
+        return Response.json(decision);
+      }
       const decision = {
         contractVersion: "1.1",
         requestId: request.requestId,
@@ -234,6 +267,7 @@ async function withMockFetch(testFn, options = {}) {
       };
       if (!/^(new|refresh)_(regular|fundrep)$/.test(decision.quotaDecision)) decision.cacheReceiptId = null;
       businessDecisions.set(businessKey, { requestHash, decision });
+      if (decision.cacheReceiptId) receiptOwners.set(decision.cacheReceiptId, ownershipKey);
       return Response.json(decision);
     }
     if (new URL(href).pathname === "/api/internal/access/cache/commit") {
@@ -259,6 +293,9 @@ async function withMockFetch(testFn, options = {}) {
         expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       };
       committedReceipts.set(request.cacheReceiptId, committed);
+      const ownerKey = receiptOwners.get(request.cacheReceiptId);
+      if (ownerKey) ownedReports.set(ownerKey, committed);
+      sharedReports.set(`${request.ticker}:${request.reportType}:${request.generationVersion}:${request.language}`, committed);
       if (options.dropFirstCommitResponse && commitCalls === 1) throw new Error("response lost after commit");
       return Response.json({ contractVersion: "1.1", cacheEntryId: committed.cacheEntryId, committed: true, expiresAt: committed.expiresAt });
     }
@@ -915,7 +952,7 @@ async function testWrongTickerFormat() {
 async function testDuplicateRequestId() {
   await withMockFetch(async (calls) => {
     const requestId = `dup-${crypto.randomUUID()}`;
-    const payload = validPayload({ requestId, tickers: ["DUPL"] });
+    const payload = validPayload({ requestId, tickers: ["DUPL"], userId: "dup-owner", generationVersion: "dup-v1" });
     const first = await postAnalyze(payload);
     assert.equal(first.status, 200);
     const firstBody = await first.json();
@@ -927,22 +964,104 @@ async function testDuplicateRequestId() {
     assert.equal(calls.yahooCalls, 1);
     assert.equal(calls.accessCalls, 2);
     assert.equal(calls.commitCalls, 1);
+    assert.equal(calls.commitRequests.length, 1);
+    assert.equal(calls.accessRequests[1].requestId, requestId);
+    assert.equal(calls.accessRequests[1].cacheStatus, "miss");
   });
 }
 
 async function testChangedDuplicatePayloadFailsClosed() {
   await withMockFetch(async (calls) => {
     const requestId = `changed-${crypto.randomUUID()}`;
-    const first = await postAnalyze(validPayload({ requestId, tickers: ["CHNG"], language: "ru" }));
+    const first = await postAnalyze(validPayload({ requestId, tickers: ["CHNG"], language: "ru", userId: "changed-owner" }));
     assert.equal(first.status, 200);
-    const second = await postAnalyze(validPayload({ requestId, tickers: ["CHNG"], language: "en" }));
+    const second = await postAnalyze(validPayload({ requestId, tickers: ["CHNG"], language: "en", userId: "changed-owner" }));
     assert.equal(second.status, 503);
     const body = await second.json();
     assert.equal(body.status, "failed");
+    assert.equal(body.report, null);
     assert.equal(body.errors[0].code, "failed_quota_service");
     assert.equal(calls.yahooCalls, 1);
     assert.equal(calls.commitCalls, 1);
     assert.equal(calls.accessCalls, 2);
+  });
+}
+
+async function testOwnRepeatNewRequestIdUsesLocalCache() {
+  await withMockFetch(async (calls) => {
+    const base = {
+      tickers: ["OWNR"],
+      userId: "owner-repeat-user",
+      generationVersion: "own-repeat-v1",
+      language: "ru",
+    };
+    const first = await postAnalyze(validPayload({ ...base, requestId: `own-first-${crypto.randomUUID()}` }));
+    assert.equal(first.status, 200);
+    const repeat = await postAnalyze(validPayload({ ...base, requestId: `own-repeat-${crypto.randomUUID()}` }));
+    assert.equal(repeat.status, 200);
+    const body = await repeat.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.report.orchestrator.status, "technical_report_cache_hit");
+    assert.equal(body.access[0].quotaDecision, "own_repeat");
+    assert.equal(body.access[0].reportSource, "own_repeat");
+    assert.equal(body.access[0].chargeUnits, 0);
+    assert.equal(body.access[0].cacheReceiptId, null);
+    assert.equal(calls.yahooCalls, 1);
+    assert.equal(calls.accessCalls, 2);
+    assert.equal(calls.commitCalls, 1);
+  });
+}
+
+async function testOwnRepeatMissingLocalCacheFailsClosed() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({
+      tickers: ["OWNM"],
+      userId: "missing-own-cache-user",
+      requestId: `own-missing-${crypto.randomUUID()}`,
+      generationVersion: "own-missing-v1",
+    }));
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.report, null);
+    assert.equal(body.errors[0].code, "cached_report_not_found");
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.commitCalls, 0);
+    assert.equal(calls.telegramCalls, 0);
+  }, {
+    accessBody: {
+      contractVersion: "1.1",
+      allowed: true,
+      chargeUnits: 0,
+      quotaDecision: "own_repeat",
+      cacheStatus: "hit",
+      reportSource: "own_repeat",
+      remainingUnits: 10,
+      reason: "Own repeat",
+      cacheReceiptId: null,
+    },
+  });
+}
+
+async function testSharedCacheForAnotherUserUsesLocalCache() {
+  await withMockFetch(async (calls) => {
+    const shared = {
+      tickers: ["SHRD"],
+      generationVersion: "shared-v1",
+      language: "ru",
+    };
+    const first = await postAnalyze(validPayload({ ...shared, requestId: `shared-first-${crypto.randomUUID()}`, userId: "shared-owner" }));
+    assert.equal(first.status, 200);
+    const second = await postAnalyze(validPayload({ ...shared, requestId: `shared-second-${crypto.randomUUID()}`, userId: "shared-other" }));
+    assert.equal(second.status, 200);
+    const body = await second.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.report.orchestrator.status, "technical_report_cache_hit");
+    assert.equal(body.access[0].quotaDecision, "cached_regular");
+    assert.equal(body.access[0].reportSource, "cached_report");
+    assert.equal(calls.yahooCalls, 1);
+    assert.equal(calls.accessCalls, 2);
+    assert.equal(calls.commitCalls, 1);
   });
 }
 
@@ -1226,6 +1345,9 @@ const tests = [
   testWrongTickerFormat,
   testDuplicateRequestId,
   testChangedDuplicatePayloadFailsClosed,
+  testOwnRepeatNewRequestIdUsesLocalCache,
+  testOwnRepeatMissingLocalCacheFailsClosed,
+  testSharedCacheForAnotherUserUsesLocalCache,
   testScannerResponseFormat,
   testDeliverySendToTelegramFalse,
   testDeliverySendToTelegramTrueRejected,

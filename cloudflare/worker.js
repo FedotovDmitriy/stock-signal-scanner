@@ -251,17 +251,12 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     }
 
     if (existing) {
-      const ownRepeat = accessChecks.every((access) => access.allowed && isOwnRepeatDecision(access));
-      if (!ownRepeat) {
+      const acceptedDuplicate = accessChecks.every((access) => access.allowed === true);
+      if (!acceptedDuplicate) {
         result = contractAccessFailureResponse(normalized, accessChecks, "Core did not confirm an idempotent repeat", "invalid_core_response");
         return result;
       }
       return existing;
-    }
-
-    if (accessChecks.some((access) => isOwnRepeatDecision(access))) {
-      result = contractAccessFailureResponse(normalized, accessChecks, "Stored Scanner result is missing for Core own_repeat", "stored_result_not_found");
-      return result;
     }
 
     normalized.forceRefresh = normalized.forceRefresh || accessChecks.some((access) => access.forceRefresh === true);

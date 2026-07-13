@@ -2325,6 +2325,44 @@ Security:
 No SERVICE_TOKEN, CORE_HMAC_SECRET, X-Signature, Authorization, or X-Scanner-Token values were logged or written to the report.
 ```
 
+### Ilya Report - SCANNER-P0-OWN-REPEAT-REMOTE-E2E - 2026-07-13
+
+```text
+Task ID: SCANNER-P0-OWN-REPEAT-REMOTE-E2E
+Environment: dev
+Scanner version: f63fc588-f459-4740-a87a-994296f1b7e4
+Core version: 6f5bcfcc-59b2-4c63-a43b-b26687fc20d2
+Generation version: devops-own-repeat-a762723d-e605-4d7c-9d8b-b6cafb56000d
+First request: PASS, requestId=devops-own-first-94c4d533-d765-4270-a9d9-b31067147d21, HTTP 200, status=processed, quotaDecision=new_regular, chargeUnits=1, reportSource=new_analysis, cache receipt present, cacheCommitStatus=committed, rows=1, errors=0
+Exact duplicate: FAIL, same requestId/payload returned HTTP 503; Core decision was new_regular, chargeUnits=1, reportSource=new_analysis; Scanner error=invalid_core_response / Core did not confirm an idempotent repeat
+Own repeat: FAIL, requestId=devops-own-repeat-f32c8eeb-2d32-4a04-9f07-6651590ea4a7, Core returned quotaDecision=own_repeat, chargeUnits=0, reportSource=own_repeat, cacheReceiptId=null; Scanner returned HTTP 503 with stored_result_not_found
+Shared cache: PASS, requestId=devops-shared-cache-d1f19b42-244e-4d28-b508-7728f3a66757, HTTP 200, status=processed, quotaDecision=cached_regular, chargeUnits=0.5, reportSource=cache, no cache receipt, rows=1, errors=0
+Provider calls: PASS for shared cache/no repeat provider inferred from reportSource=cache and scanner cacheStatus=hit; first request performed analysis
+Cache commit: PASS for first request; not expected for duplicate/own_repeat/shared cache
+Telegram delivery: PASS, sendToTelegram=false, delivered=false in all E2E responses
+Secrets exposed: no
+Production changed: no
+Checked at: 2026-07-13T21:14:59.8223883+04:00
+Result: FAIL
+Blockers: Scanner/Core duplicate and own_repeat contract behavior is not aligned. Exact duplicate gets Core new_regular instead of an idempotent repeat confirmation accepted by Scanner. Own repeat gets Core own_repeat but Scanner cannot locate the stored Scanner result and fails closed with stored_result_not_found.
+```
+
+Setup:
+
+```text
+- Confirmed Core dev active version: 6f5bcfcc-59b2-4c63-a43b-b26687fc20d2.
+- Confirmed Scanner dev CORE_SERVICE binding target: market-signal-ai-bot-dev.
+- Confirmed/created dev-only second fixture user: dev_test_scanner_user_2 with active dev subscription.
+- Used clean generationVersion for this E2E run.
+- Production was not deployed or modified.
+```
+
+Security:
+
+```text
+No SERVICE_TOKEN, CORE_HMAC_SECRET, X-Signature, Authorization, or X-Scanner-Token values were logged or written to the report.
+```
+
 ### Ilya Report - SCANNER-P0-SERVICE-BINDING-DEV-E2E - 2026-07-13
 
 ```text
