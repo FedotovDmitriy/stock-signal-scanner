@@ -1,9 +1,11 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import worker from "../cloudflare/worker.js";
 
 const originalFetch = globalThis.fetch;
+let currentCoreService = null;
 const CORE_HMAC_KEY_ID = "scanner-test-v1";
 const CORE_HMAC_SECRET = "scanner-test-hmac-secret-32-bytes-minimum";
+const MOJIBAKE_RE = /(?:\u00c3|\u00d0|\u00e2\u20ac|\u00c2|\u00e2\u201a|\u00e2\u201e|\u00c5)/;
 
 async function testSha256Hex(value) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
@@ -80,7 +82,7 @@ function validPayload(overrides = {}) {
       strategies: ["trend", "breakout", "volume_avwap", "momentum"],
     },
     delivery: { sendToTelegram: false },
-    bot: { id: "us-stocks-bot", tokenSecretName: "TELEGRAM_BOT_TOKEN_US_STOCKS_BOT" },
+    bot: { id: "private-premium-api" },
     ...overrides,
   };
 }
@@ -106,6 +108,17 @@ function allowedAccessDecision(overrides = {}) {
 }
 
 async function postAnalyze(payload, envOverrides = {}) {
+  const env = {
+    APP_ENV: "dev",
+    ...accessEnv,
+    WEBHOOK_TOKEN: "test-token",
+    ADMIN_TOKEN: "admin-token",
+    TELEGRAM_WEBHOOK_SECRET: "telegram-secret",
+    DEFAULT_TIMEFRAME: "1d",
+    CORE_SERVICE: currentCoreService,
+    ...envOverrides,
+  };
+  if (envOverrides.CORE_SERVICE === undefined && currentCoreService === null) delete env.CORE_SERVICE;
   return worker.fetch(new Request("https://scanner.test/api/external/analyze", {
     method: "POST",
     headers: {
@@ -113,15 +126,7 @@ async function postAnalyze(payload, envOverrides = {}) {
       "X-Scanner-Token": "test-token",
     },
     body: JSON.stringify(payload),
-  }), {
-    APP_ENV: "dev",
-    ...accessEnv,
-    WEBHOOK_TOKEN: "test-token",
-    ADMIN_TOKEN: "admin-token",
-    TELEGRAM_WEBHOOK_SECRET: "telegram-secret",
-    DEFAULT_TIMEFRAME: "1d",
-    ...envOverrides,
-  }, { waitUntil: () => {} });
+  }), env, { waitUntil: () => {} });
 }
 
 async function postAnalyzeWithHeaders(payload, headers = {}) {
@@ -139,6 +144,7 @@ async function postAnalyzeWithHeaders(payload, headers = {}) {
     ADMIN_TOKEN: "admin-token",
     TELEGRAM_WEBHOOK_SECRET: "telegram-secret",
     DEFAULT_TIMEFRAME: "1d",
+    CORE_SERVICE: currentCoreService,
   }, { waitUntil: () => {} });
 }
 
@@ -149,6 +155,7 @@ async function withMockFetch(testFn, options = {}) {
   let telegramCalls = 0;
   let accessCalls = 0;
   let commitCalls = 0;
+  let coreBindingCalls = 0;
   let hmacValid = true;
   const accessRequests = [];
   const commitRequests = [];
@@ -178,9 +185,15 @@ async function withMockFetch(testFn, options = {}) {
     return { rawBody, transportRequestId };
   }
 
-  globalThis.fetch = async (url, init = {}) => {
-    const href = String(url);
-    if (href === "https://bot.test/api/internal/access/check") {
+  async function handleCoreRequest(request) {
+    coreBindingCalls += 1;
+    const href = String(request.url);
+    const init = {
+      method: request.method,
+      headers: request.headers,
+      body: await request.text(),
+    };
+    if (new URL(href).pathname === "/api/internal/access/check") {
       accessCalls += 1;
       callOrder.push("core");
       if (options.accessThrows) throw new Error("quota service unavailable");
@@ -223,7 +236,7 @@ async function withMockFetch(testFn, options = {}) {
       businessDecisions.set(businessKey, { requestHash, decision });
       return Response.json(decision);
     }
-    if (href === "https://bot.test/api/internal/access/cache/commit") {
+    if (new URL(href).pathname === "/api/internal/access/cache/commit") {
       commitCalls += 1;
       callOrder.push("commit");
       const verified = await verifyCoreHmac(init, "/api/internal/access/cache/commit");
@@ -248,6 +261,16 @@ async function withMockFetch(testFn, options = {}) {
       committedReceipts.set(request.cacheReceiptId, committed);
       if (options.dropFirstCommitResponse && commitCalls === 1) throw new Error("response lost after commit");
       return Response.json({ contractVersion: "1.1", cacheEntryId: committed.cacheEntryId, committed: true, expiresAt: committed.expiresAt });
+    }
+    throw new Error(`Unexpected CORE_SERVICE fetch: ${href}`);
+  }
+
+  currentCoreService = options.coreService === null ? null : { fetch: handleCoreRequest };
+
+  globalThis.fetch = async (url, init = {}) => {
+    const href = String(url);
+    if (href === "https://bot.test/api/internal/access/check" || href === "https://bot.test/api/internal/access/cache/commit") {
+      throw new Error(`Core public fetch fallback is forbidden: ${href}`);
     }
     if (href.includes("/v10/finance/quoteSummary/")) {
       yahooCalls += 1;
@@ -303,6 +326,7 @@ async function withMockFetch(testFn, options = {}) {
       get telegramCalls() { return telegramCalls; },
       get accessCalls() { return accessCalls; },
       get commitCalls() { return commitCalls; },
+      get coreBindingCalls() { return coreBindingCalls; },
       get hmacValid() { return hmacValid; },
       accessRequests,
       commitRequests,
@@ -313,6 +337,7 @@ async function withMockFetch(testFn, options = {}) {
     });
   } finally {
     globalThis.fetch = originalFetch;
+    currentCoreService = null;
   }
 }
 
@@ -357,9 +382,23 @@ async function testCoreHmacRequestContract() {
     assert.equal(calls.accessRequests.length, 2);
     assert.equal(calls.commitRequests.length, 2);
     assert.equal(calls.accessRequests.every((request) => request.contractVersion === "1.1"), true);
+    assert.equal(calls.accessRequests.every((request) => Object.hasOwn(request, "chatId") && request.chatId === null), true);
     assert.equal(calls.accessRequests.every((request) => request.cacheStatus === "miss" && request.cacheCreatedAt === null && request.cacheGenerationVersion === null), true);
     assert.equal(calls.callOrder[0], "core");
     assert.ok(calls.callOrder.indexOf("provider") > calls.callOrder.lastIndexOf("core"));
+  });
+}
+
+async function testAccessCheckUsesCoreServiceBinding() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["BIND"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(calls.accessCalls, 1);
+    assert.equal(calls.coreBindingCalls >= 2, true);
+    assert.equal(calls.callOrder[0], "core");
+    assert.equal(calls.hmacValid, true);
   });
 }
 
@@ -385,6 +424,36 @@ async function testCacheCommitFlowAndDigest() {
     assert.match(calls.commitRequests[0].resultDigest, /^[a-f0-9]{64}$/);
     assert.ok(calls.callOrder.indexOf("commit") > calls.callOrder.indexOf("provider"));
     assert.equal(calls.authorizationHeaders.every((value) => value == null), true);
+    assert.equal(calls.coreBindingCalls, 2);
+  });
+}
+
+async function testCacheCommitUsesCoreServiceBinding() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["BCMT"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.access[0].cacheCommitStatus, "committed");
+    assert.equal(calls.accessCalls, 1);
+    assert.equal(calls.commitCalls, 1);
+    assert.equal(calls.coreBindingCalls, 2);
+    assert.deepEqual(calls.callOrder, ["core", "provider", "commit"]);
+  });
+}
+
+async function testMissingCoreServiceBindingFailsClosedBeforeAnalysis() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["NOBD"], telegramChatId: "12345" }), { CORE_SERVICE: null });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.errors[0].code, "failed_quota_service");
+    assert.equal(calls.coreBindingCalls, 0);
+    assert.equal(calls.accessCalls, 0);
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.commitCalls, 0);
+    assert.equal(calls.telegramCalls, 0);
   });
 }
 
@@ -424,7 +493,6 @@ async function testInvalidCoreHmacFailsClosed() {
   const payload = validPayload({
     tickers: ["HBAD"],
     telegramChatId: "12345",
-    delivery: { sendToTelegram: true },
   });
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(payload, { CORE_HMAC_SECRET: "wrong-scanner-hmac-secret-32-bytes-minimum" });
@@ -437,10 +505,10 @@ async function testInvalidCoreHmacFailsClosed() {
     assert.equal(calls.telegramCalls, 0);
   });
   await withMockFetch(async (calls) => {
-    const response = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    const response = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN: "fake-token" });
     assert.equal(response.status, 200);
     assert.ok(calls.yahooCalls >= 1);
-    assert.ok(calls.telegramCalls >= 1);
+    assert.equal(calls.telegramCalls, 0);
   });
 }
 
@@ -471,8 +539,7 @@ async function testDeniedCoreDecisionBlocksCacheProviderAndTelegram() {
       tickers: ["HDNY"],
       generationVersion: "hmac-v1",
       telegramChatId: "12345",
-      delivery: { sendToTelegram: true },
-    }), { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    }), { TELEGRAM_BOT_TOKEN: "fake-token" });
     assert.equal(response.status, 200);
     assert.equal((await response.json()).status, "rejected");
     assert.deepEqual(calls.callOrder, ["core"]);
@@ -792,22 +859,21 @@ async function testFundRepDuplicateRequestIdAndTelegramPrivacy() {
       tickers: ["FDUP"],
       reportType: "fundrep",
       telegramChatId: "12345",
-      delivery: { sendToTelegram: true },
     });
-    const first = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    const first = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN: "fake-token" });
     assert.equal(first.status, 200);
     const firstTelegramCalls = calls.telegramCalls;
-    const second = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+    const second = await postAnalyze(payload, { TELEGRAM_BOT_TOKEN: "fake-token" });
     assert.equal(second.status, 200);
     const secondBody = await second.json();
     assert.deepEqual(secondBody.report.tickers, ["FDUP"]);
     assert.equal(calls.fundamentalCalls, 1);
     assert.equal(calls.accessCalls, 2);
     assert.equal(calls.commitCalls, 1);
-    assert.ok(firstTelegramCalls > 0);
+    assert.equal(calls.coreBindingCalls, 3);
+    assert.equal(firstTelegramCalls, 0);
     assert.equal(calls.telegramCalls, firstTelegramCalls);
-    const userText = calls.telegramMessages.map((message) => `${message.text || ""}\n${message.caption || ""}`).join("\n");
-    assert.equal(/requestId|quotaDecision|chargeUnits|remainingUnits|reportSource/.test(userText), false);
+    assert.equal(JSON.stringify(secondBody).includes("12345"), false);
   });
 }
 
@@ -901,38 +967,69 @@ async function testDeliverySendToTelegramFalse() {
     const body = await response.json();
     assert.equal(body.telegram.sendToTelegram, false);
     assert.equal(body.telegram.delivered, false);
+    assert.equal(body.telegram.chatId, null);
+    assert.equal(JSON.stringify(body).includes("12345"), false);
+    assert.equal(calls.accessRequests[0].chatId, null);
     assert.equal(calls.telegramCalls, 0);
   });
 }
 
-async function testUpstreamLanguageControlsTelegramReport() {
+async function testDeliverySendToTelegramTrueRejected() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({
+      telegramChatId: "12345",
+      delivery: { sendToTelegram: true },
+    }), { TELEGRAM_BOT_TOKEN: "fake-token" });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.status, "rejected");
+    assert.equal(body.errors.some((error) => error.field === "delivery.sendToTelegram" && error.code === "telegram_delivery_not_allowed"), true);
+    assert.equal(JSON.stringify(body).includes("12345"), false);
+    assert.equal(calls.accessCalls, 0);
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.telegramCalls, 0);
+  });
+}
+
+async function testBotTokenSecretNameRejectedInPrivateApi() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({
+      bot: { id: "private-premium-api", tokenSecretName: "TELEGRAM_BOT_TOKEN_PRIVATE" },
+    }));
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.status, "rejected");
+    assert.equal(body.errors.some((error) => error.field === "bot.tokenSecretName" && error.code === "telegram_bot_not_allowed"), true);
+    assert.equal(calls.accessCalls, 0);
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.telegramCalls, 0);
+  });
+}
+
+async function testUpstreamLanguageControlsJsonReport() {
   const cases = [
     {
       language: "ru-RU",
       canonical: "ru",
       ticker: "LGRU",
-      expected: "Отчёт анализа",
-      forbidden: /[א-ת]|Analysis report|Status:|Price:|Movement:|Signals:|Why:|Condition:|Idea:|Stop:|Target:|Risk:/,
+      forbidden: /[\u0590-\u05ff]|Analysis report|Status:|Price:|Movement:|Signals:|Why:|Condition:|Idea:|Stop:|Target:|Risk:/,
     },
     {
       language: "en-US",
       canonical: "en",
       ticker: "LGEN",
-      expected: "Analysis report",
-      forbidden: /[А-Яа-яЁёא-ת]/,
+      forbidden: /[А-Яа-яЁё\u0590-\u05ff]/,
     },
     {
       language: "he-IL",
       canonical: "he",
       ticker: "LGHE",
-      expected: "דוח ניתוח",
       forbidden: /Отчёт анализа|Статус|Цена|Движение|Сигналы|Почему|Условие|Идея|Стоп|Цель|Риск|Analysis report|Status:|Price:|Movement:|Signals:|Why:|Condition:|Idea:|Stop:|Target:|Risk:/,
     },
     {
       language: "iw",
       canonical: "he",
       ticker: "LGIW",
-      expected: "דוח ניתוח",
       forbidden: /Отчёт анализа|Статус|Цена|Движение|Сигналы|Почему|Условие|Идея|Стоп|Цель|Риск|Analysis report|Status:|Price:|Movement:|Signals:|Why:|Condition:|Idea:|Stop:|Target:|Risk:/,
     },
   ];
@@ -943,31 +1040,57 @@ async function testUpstreamLanguageControlsTelegramReport() {
         tickers: [testCase.ticker],
         language: testCase.language,
         telegramChatId: "12345",
-        delivery: { sendToTelegram: true },
-      }), { TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token" });
+      }), { TELEGRAM_BOT_TOKEN: "fake-token" });
       assert.equal(response.status, 200);
       const body = await response.json();
       assert.equal(body.status, "processed");
       assert.equal(body.report.language, testCase.canonical);
-      const report = String(calls.telegramMessages.at(-1)?.text || "");
-      assert.equal(report.includes(testCase.expected), true);
-      assert.equal(report.includes("requestId"), false);
+      const report = JSON.stringify(body.report.items);
+      assert.equal(JSON.stringify(body).includes("12345"), false);
+      assert.equal(MOJIBAKE_RE.test(report), false);
       assert.equal(testCase.forbidden.test(report), false);
       assert.equal(testCase.forbidden.test(body.report.items[0].signals[0]?.explanation || ""), false);
+      assert.equal(calls.telegramCalls, 0);
     });
   }
 }
 
+async function testUserMessagesDoNotContainMojibake() {
+  await withMockFetch(async (calls) => {
+    const update = {
+      message: {
+        text: "AAPL",
+        chat: { id: 123, type: "private" },
+        from: { id: 456, username: "tester" },
+      },
+    };
+    const env = {
+      TELEGRAM_BOT_TOKEN: "fake-token",
+      TELEGRAM_WEBHOOK_SECRET: "telegram-secret",
+      DEFAULT_TIMEFRAME: "1d",
+    };
+    const waits = [];
+    const response = await worker.fetch(new Request("https://scanner.test/telegram/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": "telegram-secret" },
+      body: JSON.stringify(update),
+    }), env, { waitUntil: (promise) => waits.push(promise) });
+    await Promise.all(waits);
+    assert.equal(response.status, 200);
+    const text = calls.telegramMessages.map((message) => `${message.text || ""}\n${message.caption || ""}`).join("\n");
+    assert.equal(MOJIBAKE_RE.test(text), false);
+    assert.equal(text.includes("Почему:"), true);
+  });
+}
 async function testUnsupportedLanguageRejectedBeforeExternalCalls() {
   await withMockFetch(async (calls) => {
     const response = await postAnalyze(validPayload({
       language: "pl",
       telegramChatId: "12345",
-      delivery: { sendToTelegram: true },
     }), {
       ACCESS_CHECK_URL: "https://bot.test/api/internal/access/check",
       CORE_HMAC_SECRET,
-      TELEGRAM_BOT_TOKEN_US_STOCKS_BOT: "fake-token",
+      TELEGRAM_BOT_TOKEN: "fake-token",
     });
     assert.equal(response.status, 400);
     const body = await response.json();
@@ -1063,7 +1186,7 @@ async function testTelegramWebhookSecretRequired() {
     assert.deepEqual(await valid.json(), { ok: true });
     const reportText = String(calls.telegramMessages.at(-1)?.text || "");
     assert.equal(reportText.includes("requestId:"), false);
-    assert.equal(/[א-ת]/.test(reportText), false);
+    assert.equal(/[×-×ª]/.test(reportText), false);
     assert.equal(reportText.includes("Почему:"), true);
   });
 }
@@ -1072,7 +1195,10 @@ const tests = [
   testValidContractPayload,
   testAccessCheckAllowsAnalysis,
   testCoreHmacRequestContract,
+  testAccessCheckUsesCoreServiceBinding,
   testCacheCommitFlowAndDigest,
+  testCacheCommitUsesCoreServiceBinding,
+  testMissingCoreServiceBindingFailsClosedBeforeAnalysis,
   testCacheCommitRetryIsIdempotent,
   testCacheCommitReceiptFailuresDoNotHideReport,
   testInvalidCoreHmacFailsClosed,
@@ -1102,7 +1228,10 @@ const tests = [
   testChangedDuplicatePayloadFailsClosed,
   testScannerResponseFormat,
   testDeliverySendToTelegramFalse,
-  testUpstreamLanguageControlsTelegramReport,
+  testDeliverySendToTelegramTrueRejected,
+  testBotTokenSecretNameRejectedInPrivateApi,
+  testUpstreamLanguageControlsJsonReport,
+  testUserMessagesDoNotContainMojibake,
   testUnsupportedLanguageRejectedBeforeExternalCalls,
   testServiceTokenRequiredInHeader,
   testClearLogsRequiresAdminToken,

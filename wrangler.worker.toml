@@ -16,6 +16,11 @@ binding = "DB"
 database_name = "stock_signal_scanner_dev"
 database_id = "1111d17b-d208-44d1-bca4-c651ee65f54c"
 
+
+[[services]]
+binding = "CORE_SERVICE"
+service = "market-signal-ai-bot-dev"
+
 [env.production]
 name = "stock-signal-scanner-production"
 

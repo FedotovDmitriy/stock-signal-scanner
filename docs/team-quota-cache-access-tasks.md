@@ -2268,3 +2268,218 @@ Security:
 ```text
 No SERVICE_TOKEN, CORE_HMAC_SECRET, X-Signature, Authorization, or X-Scanner-Token values were logged.
 ```
+
+### Ilya Report - Remote Signed E2E Retry - 2026-07-09
+
+```text
+Environment: dev
+requestId: devops-signed-regular-ec1f5a16-1701-4a70-8544-bc384c8e1f19
+HTTP status: 503
+Core access/check: failed_quota_service / Access check HTTP 404
+analysis after allowed=true: not reached
+cache commit status: not reached
+duplicate/own_repeat result: failed closed before analysis
+Telegram delivery: not sent
+checked_at: 2026-07-09T18:40:57.9861224+04:00
+final status: FAIL / BLOCKED BY CORE 404
+```
+
+Runtime details:
+
+```text
+- Scanner active version: e826641e-dcf4-479a-a0bc-6042b74778b3.
+- Core active version: 6e58f8af-79ca-4260-8649-6278ed5fc9ed.
+- Scanner ACCESS_CHECK_URL: https://market-signal-ai-bot-dev.fnemoy.workers.dev/api/internal/access/check.
+- Scanner CORE_HMAC_KEY_ID: scanner-dev-v2.
+- Scanner /api/status: HTTP 200.
+- Wrong scanner token: HTTP 403.
+- Valid scanner token: accepted by Scanner; no HTTP 403.
+- Direct unsigned Core access/check without trailing slash: HTTP 401 internal_key_and_request_id_required.
+- Direct unsigned Core access/check with trailing slash: HTTP 401 internal_key_and_request_id_required.
+- Core route exists for both slash variants, but Scanner signed subrequest still receives HTTP 404.
+```
+
+E2E results:
+
+```text
+- regular AMD request: HTTP 503, status=failed, reason=Access check HTTP 404.
+- duplicate same requestId/ticker: HTTP 503, status=failed, reason=Access check HTTP 404.
+- own_repeat AMD request with new requestId: HTTP 503, status=failed, reason=Access check HTTP 404.
+- FundRep AAPL request: HTTP 503, status=failed, reason=Access check HTTP 404.
+- cache commit was not reached in any case.
+- delivery.sendToTelegram=false remained false; Telegram was not sent.
+- Scanner response bodies did not contain the rotated token literal.
+```
+
+Additional safe checks:
+
+```text
+- Core dev fixture user dev_test_scanner_user exists.
+- Core dev fixture subscriptions for dev_test_scanner_user exist.
+- Active quota plan policies exist.
+```
+
+Security:
+
+```text
+No SERVICE_TOKEN, CORE_HMAC_SECRET, X-Signature, Authorization, or X-Scanner-Token values were logged or written to the report.
+```
+
+### Ilya Report - SCANNER-P0-SERVICE-BINDING-DEV-E2E - 2026-07-13
+
+```text
+Task ID: SCANNER-P0-SERVICE-BINDING-DEV-E2E
+Environment: dev
+Scanner version: 97ca7aae-4e1a-41a2-8206-8287b3cd3901
+Core version: 84fd8318-b36d-4fbc-9f60-79ad883d417d
+CORE_SERVICE target: market-signal-ai-bot-dev
+RequestId: devops-service-binding-43c56d9d-3d3d-459e-8bb1-55924da78b67
+Core request observed: yes, via service binding response
+Access check: PASS, HTTP 200, allowed=true, quotaDecision=new_regular
+HMAC validation: PASS, Core accepted signed scanner-dev-v2 request
+Analysis: PASS, status=processed, rows=1, errors=0
+Cache receipt: PASS, receipt present
+Cache commit: PASS, cacheCommitStatus=committed
+Duplicate/own_repeat: FAIL, same requestId returned saved new_regular response; new requestId same user/ticker returned cached_regular, not own_repeat
+Repeated provider call: PASS for post-commit repeat path by cached_regular/cache response; exact duplicate returned saved response
+Telegram delivery: PASS, sendToTelegram=false, delivered=false
+Secrets exposed: no
+Checked at: 2026-07-13T15:46:49.7765224+04:00
+Result: FAIL
+Blockers: duplicate/own_repeat contract expectation is not met; Core/Scanner returns saved new_regular for exact duplicate and cached_regular for same user/ticker new requestId.
+```
+
+DevOps actions:
+
+```text
+- Confirmed Core dev active version: 84fd8318-b36d-4fbc-9f60-79ad883d417d.
+- Confirmed dev wrangler binding: CORE_SERVICE -> market-signal-ai-bot-dev.
+- Deployed only stock-signal-scanner-dev.
+- Production was not touched.
+- Confirmed active Scanner binding includes CORE_SERVICE service=market-signal-ai-bot-dev.
+- Fixed Scanner access/check body to include explicit chatId:null when chatId is absent, matching Core validation contract.
+```
+
+Checks:
+
+```text
+- node --check cloudflare/worker.js: PASS.
+- npm.cmd run test:worker-contract: PASS.
+- service binding access/check local contract test: PASS.
+- service binding cache/commit local contract test: PASS.
+- missing CORE_SERVICE fail-closed local contract test: PASS.
+```
+
+Security:
+
+```text
+No SERVICE_TOKEN, CORE_HMAC_SECRET, X-Signature, Authorization, or X-Scanner-Token values were logged or written to the report.
+```
+
+### Oleg QA Report - Private API-only Boundary - 2026-07-09
+
+```text
+QA Report
+
+Task: SCANNER-P0-PRIVATE-API-ONLY-BOUNDARY
+Environment: local code/test QA
+
+Status: PASS for POST /api/external/analyze private API-only boundary
+
+Checked:
+- Contract validation
+- Response format
+- Private API-only delivery boundary
+- Telegram delivery blocking
+- Core access payload boundary
+- JSON-only API response
+- Regression smoke
+
+Findings:
+1. [info] /api/external/analyze rejects delivery.sendToTelegram=true before access check.
+2. [info] /api/external/analyze rejects bot.tokenSecretName before access check.
+3. [info] /api/external/analyze clears chatId in the response and does not pass chatId/telegramChatId to Core access/check.
+4. [info] /api/external/analyze does not call Telegram API in the private boundary scenario.
+5. [info] /api/external/analyze returns application/json and the tested API response contains no HTML.
+6. [risk] Legacy Telegram routes still exist outside the private premium flow. This does not fail the /api/external/analyze boundary, but production ownership for those routes remains a separate manager/DevOps decision.
+
+Focused QA:
+- valid private payload with chatId + delivery.sendToTelegram=false: PASS
+- Core access/check called without chatId/telegramChatId: PASS
+- provider analysis runs only after allowed Core decision: PASS
+- cache commit after successful new_regular analysis: PASS
+- Telegram API calls: PASS, 0 calls
+- delivery.sendToTelegram=true rejected before access: PASS
+- bot.tokenSecretName rejected before access: PASS
+- API response JSON-only/no HTML: PASS
+
+Regression:
+- npm.cmd run test:worker-contract - PASS, 40/40
+- node --check cloudflare\worker.js - PASS
+
+Recommendation:
+Private API-only boundary can be accepted for dev.
+Do not release production yet: the broader v1.1 gate remains blocked by remote Core signed E2E / access-check issue.
+```
+
+### Oleg QA Report - Service Binding QA - 2026-07-13
+
+```text
+Task ID: SCANNER-P0-SERVICE-BINDING-QA
+Status: PASS
+
+Contract tests:
+PASS
+- npm.cmd run test:worker-contract: PASS, 44/44
+- node --check cloudflare\worker.js: PASS
+
+Encoding check:
+PASS
+- Runtime Russian report/error samples are clean:
+  Отчёт анализа, Почему, Недостаточно данных для анализа, Фундаментальный отчёт по AAPL, Компания.
+- cloudflare/worker.js and cloudflare/report-i18n.js contain no actual U+00D0/U+00D1/U+FFFD mojibake markers by UTF-8 codepoint scan.
+- Non-blocking hygiene note: tests/worker-contract-smoke.mjs still has one mojibake-looking Hebrew regex literal in a test assertion. It is not a runtime Russian text/report output and did not break regression.
+
+Access binding:
+PASS
+- access/check is called through env.CORE_SERVICE.fetch(...).
+- Focused QA: allowed request used service binding once for /api/internal/access/check.
+- Global/public fetch fallback for access/check was not called.
+
+Cache commit binding:
+PASS
+- access/cache/commit is called through env.CORE_SERVICE.fetch(...).
+- Focused QA: successful new_regular request used service binding once for /api/internal/access/cache/commit.
+- Commit HMAC canonical path remained /api/internal/access/cache/commit.
+
+Public fallback absent:
+PASS
+- Focused QA forced public Core fetch to throw; allowed/deny/error/missing-binding scenarios did not use public Core fetch.
+- ACCESS_CHECK_URL/MARKET_SIGNAL_AI_BOT_URL are used only to build canonical/path configuration, not as transport fallback.
+
+Fail-closed:
+PASS
+- Missing CORE_SERVICE binding: HTTP 503, status=failed, no provider, no cache commit, no Telegram.
+- Core deny: HTTP 200, status=rejected, no provider, no cache commit, no Telegram.
+- Core HTTP 500/error: HTTP 503, status=failed, no provider, no cache commit, no Telegram.
+
+HMAC canonical path/body:
+PASS
+- access/check signature was verified against:
+  timestamp.keyId.transportRequestId.POST./api/internal/access/check..sha256(body)
+- cache/commit signature was verified against:
+  timestamp.keyId.transportRequestId.POST./api/internal/access/cache/commit..sha256(body)
+- No Bearer Authorization header is required for Core transport.
+
+Production binding absent:
+PASS
+- wrangler.worker.toml has root/dev CORE_SERVICE binding to market-signal-ai-bot-dev.
+- [env.production] has no CORE_SERVICE service binding and no [[env.production.services]] section.
+
+Blocking defects:
+None.
+
+Ready for Ilya: yes
+- QA accepts local service-binding behavior.
+- Ilya can proceed with environment/deployment verification and production binding decision.
+```

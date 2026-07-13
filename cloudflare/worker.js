@@ -42,6 +42,7 @@ export default {
           endpoints: ["/api/status", "/api/admin/access-list", "/scan", "/api/external/analyze", "/api/webhook/analyze", "/api/test-telegram", "/api/clear-logs", "/telegram/webhook"],
         });
       }
+
       if (request.method === "GET" && url.pathname === "/api/status") {
         const logs = await latestLogs(env);
         const tickerLogs = await latestTickerLogs(env);
@@ -136,7 +137,7 @@ export default {
 async function runAnalysisFromPayload(payload, env, origin, requestCountryLabel = "-", ctx = null) {
   const normalized = normalizeExternalPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
-  if (!tickers.length) throw httpError("ÐŸÐµÑ€ÐµÐ´Ð°Ð¹Ñ‚Ðµ ticker Ð¸Ð»Ð¸ tickers", 400);
+  if (!tickers.length) throw httpError("Передайте ticker или tickers", 400);
 
   const { timeframe, strategies, risk, anchorBars, chatId, country, bot, news, delivery } = normalized;
   const requestKey = normalized.requestId || news?.id || crypto.randomUUID();
@@ -213,9 +214,9 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     return contractRejectedResponse(requestId, validation.errors);
   }
 
-  const normalized = normalizeExternalPayload(payload, env);
+  const normalized = normalizeContractPayload(payload, env);
   const tickers = normalized.tickers.map((ticker) => ticker.symbol);
-  const { timeframe, strategies, risk, anchorBars, chatId, country, bot, news, delivery, language } = normalized;
+  const { timeframe, strategies, risk, anchorBars, country, news, language } = normalized;
   const logCountry = requestCountryLabel && requestCountryLabel !== "-" ? requestCountryLabel : payloadCountryLabel(country);
   let result;
 
@@ -226,7 +227,7 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
       tickers,
       status: "received",
       country: logCountry,
-      chatId,
+      chatId: null,
       detail: `contractVersion=${CONTRACT_VERSION}; timeframe=${timeframe}; request=${requestId}`,
     });
     await addLog(env, origin, "External contract analysis", tickers.join(", "), "started", `request=${requestId}; timeframe=${timeframe}`, logCountry);
@@ -316,20 +317,11 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     scannerResult.origin = origin;
     scannerResult.requestId = requestId;
     scannerResult.country = country;
-    scannerResult.bot = bot;
     scannerResult.news = news;
     scannerResult.language = language;
     scannerResult.access = accessChecks;
 
-    const telegram = { sendToTelegram: Boolean(chatId && delivery.sendToTelegram), delivered: false, chatId: chatId || null };
-    if (telegram.sendToTelegram) {
-      if (news) await sendTelegram(env, chatId, newsMessage(normalized), bot);
-      if (normalized.reportType === "fundrep") telegram.delivered = (await sendFundRepContractTelegram(env, chatId, scannerResult, bot)) > 0;
-      else {
-        await sendTelegram(env, chatId, analysisReportMessage(scannerResult), bot);
-        telegram.delivered = true;
-      }
-    }
+    const telegram = { sendToTelegram: false, delivered: false, chatId: null };
 
     result = contractProcessedResponse(normalized, scannerResult, telegram, accessChecks);
     await addLog(
@@ -1341,7 +1333,7 @@ async function sendTelegram(env, chatId, text, bot = {}) {
     body: JSON.stringify({ chat_id: chatId, text }),
   });
   const data = await response.json();
-  if (!data.ok) throw new Error(data.description || "Telegram Ð½Ðµ Ð¿Ñ€Ð¸Ð½ÑÐ» ÑÐ¾Ð¾Ð±Ñ‰ÐµÐ½Ð¸Ðµ");
+  if (!data.ok) throw new Error(data.description || "Telegram не принял сообщение");
 }
 
 async function sendTelegramDocument(env, chatId, filename, content, caption = "", bot = {}) {
@@ -1421,11 +1413,17 @@ function validateContractPayload(payload) {
   }
   if (payload.bot && typeof payload.bot === "object") {
     if (payload.bot.token || payload.bot.telegramToken || payload.bot.botToken) {
-      errors.push(contractError("bot", "Do not send Telegram tokens in payload; use bot.tokenSecretName and Cloudflare secrets"));
+      errors.push(contractError("bot", "Do not send Telegram tokens in private premium API payload"));
+    }
+    if (payload.bot.tokenSecretName || payload.bot.token_secret_name) {
+      errors.push(contractError("bot.tokenSecretName", "Telegram bot token secrets are not allowed in private premium API", "telegram_bot_not_allowed"));
     }
   }
   if (payload.telegramToken || payload.botToken || payload.tokenSecret) {
     errors.push(contractError("telegram", "Do not send Telegram tokens in payload"));
+  }
+  if (payload.delivery && typeof payload.delivery === "object" && payload.delivery.sendToTelegram === true) {
+    errors.push(contractError("delivery.sendToTelegram", "Telegram delivery is not allowed in private premium API", "telegram_delivery_not_allowed"));
   }
   const forbiddenBusinessFields = [
     "quota",
@@ -1821,7 +1819,6 @@ function mergeContractScannerResults(normalized, freshResult, cachedResults) {
     },
   };
 }
-
 function contractCacheStatus(normalized, freshCount, cachedCount) {
   if (freshCount > 0 && cachedCount > 0) return "mixed";
   if (cachedCount > 0) return "hit";
@@ -1842,7 +1839,7 @@ async function checkContractAccessForTickers(env, normalized, origin = "-", coun
   const endpoint = accessCheckUrl(env);
   const keyId = String(env.CORE_HMAC_KEY_ID || "").trim();
   const secret = String(env.CORE_HMAC_SECRET || "").trim();
-  if (!endpoint || !keyId || secret.length < 32) {
+  if (!endpoint || !coreAccessBinding(env) || !keyId || secret.length < 32) {
     return normalized.tickers.map((ticker) => accessFailedDecision(normalized, ticker.symbol, "Access check is not configured"));
   }
 
@@ -1852,7 +1849,7 @@ async function checkContractAccessForTickers(env, normalized, origin = "-", coun
       const cacheHint = existingAccessCacheHint(existingResult, ticker.symbol) || await contractCacheHint(env, normalized, ticker.symbol);
       const body = JSON.stringify(accessCheckRequest(normalized, ticker.symbol, cacheHint));
       const headers = await coreHmacHeaders("POST", endpoint, body, keyId, secret);
-      const response = await fetch(endpoint, {
+      const response = await coreAccessFetch(env, endpoint, {
         method: "POST",
         headers,
         body,
@@ -1885,11 +1882,30 @@ function isProduction(env) {
   return ["production", "prod"].includes(String(env.APP_ENV || "").trim().toLowerCase());
 }
 
+function coreAccessBinding(env) {
+  const binding = env.CORE_SERVICE;
+  return binding && typeof binding.fetch === "function" ? binding : null;
+}
+
+function coreAccessFetchUrl(endpoint) {
+  const url = new URL(endpoint);
+  return new URL(`${url.pathname}${url.search}`, "https://core.internal").toString();
+}
+
+function coreAccessMode(env) {
+  return coreAccessBinding(env) ? "service_binding" : "not_configured";
+}
+
+async function coreAccessFetch(env, endpoint, init) {
+  const binding = coreAccessBinding(env);
+  if (!binding) throw new Error("CORE_SERVICE binding is not configured");
+  return binding.fetch(new Request(coreAccessFetchUrl(endpoint), init));
+}
 function accessCheckUrl(env) {
   const explicit = String(env.ACCESS_CHECK_URL || "").trim();
   if (explicit) return explicit;
   const base = String(env.MARKET_SIGNAL_AI_BOT_URL || "").trim().replace(/\/+$/, "");
-  return base ? `${base}${ACCESS_CHECK_PATH}` : "";
+  return base ? `${base}${ACCESS_CHECK_PATH}` : `https://core.internal${ACCESS_CHECK_PATH}`;
 }
 
 function accessCheckRequest(normalized, ticker, cacheHint) {
@@ -1897,7 +1913,7 @@ function accessCheckRequest(normalized, ticker, cacheHint) {
     contractVersion: CORE_ACCESS_CONTRACT_VERSION,
     requestId: normalized.requestId,
     userId: normalized.userId,
-    chatId: normalized.chatId,
+    chatId: normalized.chatId || null,
     ticker,
     reportType: normalized.reportType,
     generationVersion: normalized.generationVersion,
@@ -2028,7 +2044,7 @@ async function commitCoreCacheReceipt(env, normalized, access, resultDigest) {
   const endpoint = accessEndpoint ? new URL("/api/internal/access/cache/commit", accessEndpoint).toString() : "";
   const keyId = String(env.CORE_HMAC_KEY_ID || "").trim();
   const secret = String(env.CORE_HMAC_SECRET || "").trim();
-  if (!endpoint || !keyId || secret.length < 32) return { ok: false, code: "cache_commit_not_configured" };
+  if (!endpoint || !coreAccessBinding(env) || !keyId || secret.length < 32) return { ok: false, code: "cache_commit_not_configured" };
   const body = JSON.stringify({
     contractVersion: CORE_ACCESS_CONTRACT_VERSION,
     cacheReceiptId: access.cacheReceiptId,
@@ -2043,7 +2059,7 @@ async function commitCoreCacheReceipt(env, normalized, access, resultDigest) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const headers = await coreHmacHeaders("POST", endpoint, body, keyId, secret);
-      const response = await fetch(endpoint, { method: "POST", headers, body, signal: AbortSignal.timeout(5000) });
+      const response = await coreAccessFetch(env, endpoint, { method: "POST", headers, body, signal: AbortSignal.timeout(5000) });
       let data = null;
       try {
         data = await response.json();
@@ -2124,6 +2140,17 @@ function normalizeExternalPayload(payload, env) {
       async: delivery.async === true || payload.async === true,
     },
   };
+}
+
+function normalizeContractPayload(payload, env) {
+  const normalized = normalizeExternalPayload(payload, env);
+  normalized.chatId = null;
+  normalized.bot = {};
+  normalized.delivery = {
+    ...normalized.delivery,
+    sendToTelegram: false,
+  };
+  return normalized;
 }
 
 function normalizeLanguage(value) {
@@ -2799,8 +2826,8 @@ function isValidTicker(ticker) {
 }
 
 function tickerValidationError(ticker) {
-  if (ticker.length > MAX_TICKER_LENGTH) return `ÑÐ»Ð¸ÑˆÐºÐ¾Ð¼ Ð´Ð»Ð¸Ð½Ð½Ñ‹Ð¹ Ñ‚Ð¸ÐºÐµÑ€, Ð¼Ð°ÐºÑÐ¸Ð¼ÑƒÐ¼ ${MAX_TICKER_LENGTH} ÑÐ¸Ð¼Ð²Ð¾Ð»Ð¾Ð²`;
-  return "Ð½ÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ñ‚Ð¸ÐºÐµÑ€";
+  if (ticker.length > MAX_TICKER_LENGTH) return `слишком длинный тикер, максимум ${MAX_TICKER_LENGTH} символов`;
+  return "некорректный тикер";
 }
 
 function normalizeStrategies(value) {
@@ -2850,11 +2877,11 @@ function assertServiceToken(request, env) {
 
 function assertWebhookToken(request, env, payload) {
   const expected = String(env.WEBHOOK_TOKEN || "").trim();
-  if (!expected) throw httpError("WEBHOOK_TOKEN Ð½Ðµ Ð·Ð°Ð´Ð°Ð½", 500);
+  if (!expected) throw httpError("WEBHOOK_TOKEN не задан", 500);
   const authorization = request.headers.get("Authorization") || "";
   const bearer = authorization.toLowerCase().startsWith("bearer ") ? authorization.slice(7).trim() : "";
   const provided = request.headers.get("X-Scanner-Token") || bearer || payload.token || payload.apiToken || "";
-  if (provided !== expected) throw httpError("ÐÐµÐ²ÐµÑ€Ð½Ñ‹Ð¹ Webhook/API token", 403);
+  if (provided !== expected) throw httpError("Неверный Webhook/API token", 403);
 }
 
 function assertTelegramWebhookSecret(request, env) {

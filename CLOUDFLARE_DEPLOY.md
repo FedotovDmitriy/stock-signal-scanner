@@ -94,8 +94,9 @@ Required Worker settings (store token/secret values as Cloudflare secrets and UR
 - `WEBHOOK_TOKEN` - legacy scanner token and fallback service token.
 - `CORE_HMAC_SECRET` - scanner-specific HMAC secret shared with Core; store only as a Cloudflare secret and use at least 32 random bytes.
 - `CORE_HMAC_KEY_ID` - non-secret scanner signing key ID configured as an environment variable, with different values in dev and production.
-- `ACCESS_CHECK_URL` - non-secret full Core quota/access endpoint URL, for example `https://market-signal-ai-bot.example.workers.dev/api/internal/access/check`.
-- `MARKET_SIGNAL_AI_BOT_URL` - optional base URL alternative; if `ACCESS_CHECK_URL` is missing, scanner calls `<MARKET_SIGNAL_AI_BOT_URL>/api/internal/access/check`.
+- `CORE_SERVICE` - required Cloudflare service binding to the Core Worker. Scanner calls Core access/check and cache/commit only through this binding.
+- `ACCESS_CHECK_URL` - optional non-secret Core access/check URL used only to preserve the signed canonical pathname/query. It is not used as a public HTTP transport.
+- `MARKET_SIGNAL_AI_BOT_URL` - optional base URL alternative for canonical path construction only. It is not used as a public HTTP transport.
 - `REPORT_GENERATION_VERSION` - optional report cache generation version; defaults to `1`. Change it when report-generation logic changes and old cached reports must not be reused.
 - `DEFAULT_LANGUAGE` - optional language for direct Telegram commands; supports `ru`, `en`, and `he`, and defaults to `ru`. Contract requests use their upstream `language` value.
 - `TELEGRAM_WEBHOOK_SECRET` - secret checked against Telegram `X-Telegram-Bot-Api-Secret-Token`.
@@ -122,7 +123,7 @@ npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 npx wrangler secret put ADMIN_TOKEN
 ```
 
-Add `CORE_HMAC_KEY_ID` and `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` as environment variables in Cloudflare. There is no access-check bypass: dev and production both fail closed when Core signing configuration is missing or Core is unavailable.
+Add `CORE_HMAC_KEY_ID` as an environment variable and configure the `CORE_SERVICE` service binding in Cloudflare. `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` may remain as canonical path configuration, but Scanner does not use public HTTP fallback for Core. There is no access-check bypass: dev and production both fail closed when Core service binding, signing configuration, or Core itself is unavailable.
 
 For production environment:
 
@@ -136,7 +137,9 @@ npx wrangler secret put TELEGRAM_WEBHOOK_SECRET --env production
 npx wrangler secret put ADMIN_TOKEN --env production
 ```
 
-Production must have `CORE_HMAC_KEY_ID`, `CORE_HMAC_SECRET`, and `ACCESS_CHECK_URL` or `MARKET_SIGNAL_AI_BOT_URL` configured. Scanner signs every access and cache-commit request with HMAC-SHA256 over `<timestamp>.<key_id>.<transport_request_id>.<method>.<pathname>.<canonical_query>.<sha256_raw_body>` and sends `X-Key-Id`, a unique transport `X-Request-Id`, `X-Timestamp`, and `X-Signature`. Scanner never sends the HMAC secret as Bearer authorization. If Core is unavailable, rejects HMAC, or returns an invalid response, `POST /api/external/analyze` fails closed before analysis, providers, or Telegram.
+Production must have `CORE_SERVICE`, `CORE_HMAC_KEY_ID`, and `CORE_HMAC_SECRET` configured. Scanner signs every access and cache-commit request with HMAC-SHA256 over `<timestamp>.<key_id>.<transport_request_id>.<method>.<pathname>.<canonical_query>.<sha256_raw_body>` and sends `X-Key-Id`, a unique transport `X-Request-Id`, `X-Timestamp`, and `X-Signature` through the service binding. Scanner never sends the HMAC secret as Bearer authorization and never falls back to public `fetch()` for Core in dev or production. If Core binding is missing, Core is unavailable, rejects HMAC, or returns an invalid response, `POST /api/external/analyze` fails closed before analysis, providers, cache commit, or Telegram.
+
+Current repository config includes the dev `CORE_SERVICE` binding only. Production bindings are not inherited from dev and must be added separately by DevOps after Ilya confirms the real Core production Worker name.
 
 Before `POST /api/internal/access/check`, scanner reads only local cache metadata and signs the real `cacheStatus`, `cacheCreatedAt`, and `cacheGenerationVersion` as part of the request body. These fields are diagnostic hints; Core alone decides billing and whether `reportSource=cache` is valid.
 
