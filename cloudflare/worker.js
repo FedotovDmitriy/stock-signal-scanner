@@ -640,7 +640,139 @@ function hasFundamentalSummary(summary) {
   return sections.some((section) => Object.values(section || {}).some((value) => value != null));
 }
 
+// --- MOEX ISS (Московская биржа) провайдер для российских тикеров вида SBER.ME ---
+// Yahoo после санкций-2022 не отдаёт .ME тикеры, поэтому для них берём дневные
+// свечи из публичного MOEX ISS API (без ключа). Меняется только источник свечей —
+// формат свечей и вся логика анализа (EMA200, RSI, ATR, AVWAP) остаются прежними.
+const MOEX_ISS_CANDLES_BASE = "https://iss.moex.com/iss/engines/stock/markets/shares/securities";
+const MOEX_CANDLE_HISTORY_DAYS = 400; // ~250 торговых дней истории (хватает на EMA200)
+const MOEX_MAX_CANDLE_PAGES = 8; // предохранитель от бесконечной пагинации ISS
+
+function isMoexTicker(ticker) {
+  return /\.ME$/i.test(String(ticker || "").trim());
+}
+
+function moexSecid(ticker) {
+  return String(ticker || "").trim().toUpperCase().replace(/\.ME$/i, "");
+}
+
+function moexDateStr(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+// ISS отдаёт begin как "YYYY-MM-DD HH:MM:SS" (МСК). Для анализа важен только порядок
+// и день, поэтому переводим в unix-секунды, интерпретируя строку как UTC.
+function moexBeginToTimestamp(begin) {
+  if (begin == null) return Math.floor(Date.now() / 1000);
+  const ms = Date.parse(String(begin).replace(" ", "T") + "Z");
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : Math.floor(Date.now() / 1000);
+}
+
+// Маппинг ISS candles.columns/candles.data в тот же формат свечей, что у Yahoo:
+// { timestamp, open, high, low, close, volume }. Индексы берём из columns (порядок не хардкодим).
+function mapMoexCandles(columns, rows) {
+  const idx = {};
+  columns.forEach((name, i) => { idx[name] = i; });
+  const out = [];
+  for (const row of rows) {
+    const close = Number(row[idx.close]);
+    if (!Number.isFinite(close)) continue;
+    const open = Number(row[idx.open]);
+    const high = Number(row[idx.high]);
+    const low = Number(row[idx.low]);
+    out.push({
+      timestamp: moexBeginToTimestamp(row[idx.begin]),
+      open: Number.isFinite(open) ? open : close,
+      high: Number.isFinite(high) ? high : close,
+      low: Number.isFinite(low) ? low : close,
+      close,
+      volume: Number(row[idx.volume] ?? 0) || 0,
+    });
+  }
+  return out;
+}
+
+// Курсор пагинации ISS лежит в блоке candles.cursor c колонками INDEX/TOTAL/PAGESIZE.
+function parseMoexCursor(data) {
+  const columns = data?.["candles.cursor"]?.columns;
+  const rows = data?.["candles.cursor"]?.data;
+  if (!Array.isArray(columns) || !Array.isArray(rows) || !rows.length) return null;
+  const idx = {};
+  columns.forEach((name, i) => { idx[name] = i; });
+  const index = Number(rows[0][idx.INDEX]);
+  const total = Number(rows[0][idx.TOTAL]);
+  const pagesize = Number(rows[0][idx.PAGESIZE]);
+  if (![index, total, pagesize].every(Number.isFinite)) return null;
+  return { index, total, pagesize };
+}
+
+async function fetchMoexCandles(ticker, timeframe, env = {}, options = {}) {
+  const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
+  const cacheKey = `market:${ticker}:moex:${tf.interval}`;
+  const cachedCandles = options.forceRefresh ? null : await getAnalysisCache(env, cacheKey);
+  if (cachedCandles) return cachedCandles;
+
+  const secid = moexSecid(ticker);
+  if (!secid) throw analysisError("MOEX ISS: пустой тикер", "NO_MARKET_DATA");
+
+  const till = new Date();
+  const from = new Date(till.getTime() - MOEX_CANDLE_HISTORY_DAYS * 86400 * 1000);
+  const fromStr = moexDateStr(from);
+  const tillStr = moexDateStr(till);
+
+  const byTimestamp = new Map();
+  let providerError = "";
+  let start = 0;
+  // ISS отдаёт свечи порциями (~500) от старых к новым, поэтому проходим все страницы,
+  // чтобы получить самые свежие бары.
+  for (let page = 0; page < MOEX_MAX_CANDLE_PAGES; page += 1) {
+    const url = `${MOEX_ISS_CANDLES_BASE}/${encodeURIComponent(secid)}/candles.json?from=${fromStr}&till=${tillStr}&interval=24&start=${start}`;
+    let response;
+    try {
+      response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    } catch (error) {
+      providerError = `${secid}: MOEX ISS network error ${error.message || error}`;
+      break;
+    }
+    if (!response.ok) {
+      providerError = `${secid}: MOEX ISS HTTP ${response.status}`;
+      break;
+    }
+    let data;
+    try {
+      data = await response.json();
+    } catch (error) {
+      providerError = `${secid}: MOEX ISS invalid JSON ${error.message || error}`;
+      break;
+    }
+    const columns = data?.candles?.columns;
+    const rows = data?.candles?.data;
+    if (!Array.isArray(columns) || !Array.isArray(rows)) {
+      providerError = providerError || `${secid}: MOEX ISS нет блока candles`;
+      break;
+    }
+    for (const candle of mapMoexCandles(columns, rows)) {
+      byTimestamp.set(candle.timestamp, candle);
+    }
+    if (!rows.length) break;
+    const cursor = parseMoexCursor(data);
+    if (!cursor) break; // нет курсора — считаем, что это единственная страница
+    start = cursor.index + rows.length;
+    if (start >= cursor.total) break;
+  }
+
+  const candles = [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
+  if (!candles.length) {
+    if (providerError) throw analysisError(providerError, "DATA_PROVIDER_ERROR");
+    throw analysisError(`${secid}: MOEX ISS нет рыночных данных`, "NO_MARKET_DATA");
+  }
+  if (candles.length < 60) throw analysisError("Недостаточно свечей для анализа", "INSUFFICIENT_DATA");
+  await setAnalysisCache(env, cacheKey, "market_candles", candles, MARKET_CACHE_TTL_SECONDS);
+  return candles;
+}
+
 async function fetchCandles(ticker, timeframe, env = {}, options = {}) {
+  if (isMoexTicker(ticker)) return fetchMoexCandles(ticker, timeframe, env, options);
   const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
   const cacheKey = `market:${ticker}:${tf.interval}:${tf.range}`;
   const cachedCandles = options.forceRefresh ? null : await getAnalysisCache(env, cacheKey);
@@ -824,7 +956,7 @@ function unifiedResultItem({ ticker, row = null, errors = [], analysisType = "te
       explanation: `${signal.condition}. ${marketContext(row, language)}`,
     })) : [],
     fundamentalSummary: fundamentals ? buildFundamentalSummary(ticker, row, fundamentals, language) : null,
-    dataSources: dataSourcesForItem(analysisType, fundamentals, row),
+    dataSources: dataSourcesForItem(analysisType, fundamentals, row, ticker),
     errors: errors.map((error) => ({
       code: statusFromErrorCode(error.code),
       message: localizedStatus(statusFromErrorCode(error.code), language),
@@ -867,9 +999,11 @@ function statusFromErrorCode(code) {
   return "data_provider_error";
 }
 
-function dataSourcesForItem(analysisType, fundamentals = null, row = null) {
-  if (analysisType !== "fundamental") return ["Yahoo Finance chart"];
-  const technicalSource = row ? ["Yahoo Finance chart"] : [];
+function dataSourcesForItem(analysisType, fundamentals = null, row = null, ticker = null) {
+  // Для российских .ME тикеров технические свечи берутся из MOEX ISS, а не из Yahoo.
+  const technicalLabel = isMoexTicker(ticker) ? "MOEX ISS" : "Yahoo Finance chart";
+  if (analysisType !== "fundamental") return [technicalLabel];
+  const technicalSource = row ? [technicalLabel] : [];
   if (fundamentals?.fundrepDataStatus === "full") return ["Yahoo Finance quoteSummary", ...technicalSource];
   if (fundamentals?.fundrepDataStatus === "partial") return ["Yahoo Finance quote", ...technicalSource];
   return [];
