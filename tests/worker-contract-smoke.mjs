@@ -47,6 +47,37 @@ function candlesPayload(symbol = "AAPL") {
   };
 }
 
+// Ответ MOEX ISS candles.json с пагинацией: total свечей, страницами по pagesize.
+// Колонки в реальном ISS-порядке (open/close/high/low/value/volume/begin/end).
+function moexCandlesPayload(secid = "SBER", { total = 220, start = 0, pagesize = 100 } = {}) {
+  const columns = ["open", "close", "high", "low", "value", "volume", "begin", "end"];
+  const data = [];
+  const baseMs = Date.UTC(2025, 0, 1);
+  for (let i = start; i < Math.min(start + pagesize, total); i += 1) {
+    const close = 200 + i * 0.5;
+    const day = new Date(baseMs + i * 86400 * 1000);
+    const begin = `${day.toISOString().slice(0, 10)} 00:00:00`;
+    const end = `${day.toISOString().slice(0, 10)} 23:59:59`;
+    data.push([
+      close - 0.3, // open
+      close, // close
+      close + 1.2, // high
+      close - 1.2, // low
+      close * 1500 * 1000, // value (рублёвый оборот)
+      1500000 + i * 1000, // volume (штук)
+      begin,
+      end,
+    ]);
+  }
+  return {
+    candles: { columns, data },
+    "candles.cursor": {
+      columns: ["INDEX", "TOTAL", "PAGESIZE"],
+      data: [[start, total, pagesize]],
+    },
+  };
+}
+
 function fundamentalPayload(symbol = "AAPL") {
   return {
     quoteSummary: {
@@ -151,6 +182,7 @@ async function postAnalyzeWithHeaders(payload, headers = {}) {
 async function withMockFetch(testFn, options = {}) {
   let yahooCalls = 0;
   let chartCalls = 0;
+  let moexCalls = 0;
   let fundamentalCalls = 0;
   let telegramCalls = 0;
   let accessCalls = 0;
@@ -325,6 +357,20 @@ async function withMockFetch(testFn, options = {}) {
       if (options.fundamentalStatus) return Response.json({ error: "fundamental provider unavailable" }, { status: options.fundamentalStatus });
       return Response.json({ quoteResponse: { result: [] } });
     }
+    if (href.includes("iss.moex.com")) {
+      moexCalls += 1;
+      callOrder.push("provider");
+      if (options.moexStatus) {
+        return Response.json({ error: "iss unavailable" }, { status: options.moexStatus });
+      }
+      if (options.moexEmpty) {
+        return Response.json({ candles: { columns: ["open", "close", "high", "low", "value", "volume", "begin", "end"], data: [] } });
+      }
+      const parsed = new URL(href);
+      const secid = parsed.pathname.split("/securities/")[1].split("/")[0];
+      const start = Number(parsed.searchParams.get("start") || 0);
+      return Response.json(moexCandlesPayload(secid, { start }));
+    }
     if (href.includes("query1.finance.yahoo.com")) {
       yahooCalls += 1;
       chartCalls += 1;
@@ -359,6 +405,7 @@ async function withMockFetch(testFn, options = {}) {
     await testFn({
       get yahooCalls() { return yahooCalls; },
       get chartCalls() { return chartCalls; },
+      get moexCalls() { return moexCalls; },
       get fundamentalCalls() { return fundamentalCalls; },
       get telegramCalls() { return telegramCalls; },
       get accessCalls() { return accessCalls; },
@@ -659,6 +706,64 @@ async function testInternalScannerFailureReturnsFailedStatus() {
     assert.equal(body.status, "failed");
     assert.equal(body.errors[0].code, "scanner_error");
   }, { yahooJsonThrows: true });
+}
+
+async function testMoexTickerRoutesToIssProvider() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["SBER.ME"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.report.analysisType, "technical");
+    const item = body.report.items[0];
+    assert.equal(item.ticker, "SBER.ME");
+    // Свечи должны приехать из MOEX ISS, а не из Yahoo chart.
+    assert.ok(item.dataSources.includes("MOEX ISS"));
+    assert.equal(item.dataSources.includes("Yahoo Finance chart"), false);
+    assert.ok(calls.moexCalls >= 1);
+    assert.equal(calls.chartCalls, 0);
+    // Маппинг ISS -> внутренние свечи корректен: индикаторы посчитаны, цена есть.
+    assert.equal(typeof item.price.value, "number");
+    assert.equal(typeof item.indicators.ema200, "number");
+  });
+}
+
+function testMoexPaginationPagesUntilEnd() {
+  // Проверяем чистую логику пагинации/маппинга без сети: моком fetch отдаём 3 страницы.
+  return withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["GAZP.ME"] }));
+    assert.equal(response.status, 200);
+    // 220 свечей при pagesize=100 => 3 запроса к ISS (start=0,100,200).
+    assert.equal(calls.moexCalls, 3);
+    const body = await response.json();
+    assert.equal(body.report.items[0].ticker, "GAZP.ME");
+  });
+}
+
+async function testRegularTickerStaysOnYahoo() {
+  await withMockFetch(async (calls) => {
+    // Уникальный тикер, чтобы не попасть в модульный кэш свечей от других тестов.
+    const response = await postAnalyze(validPayload({ tickers: ["USYA"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const item = body.report.items[0];
+    assert.ok(item.dataSources.includes("Yahoo Finance chart"));
+    assert.equal(item.dataSources.includes("MOEX ISS"), false);
+    assert.equal(calls.chartCalls, 1);
+    assert.equal(calls.moexCalls, 0);
+  });
+}
+
+async function testMoexProviderFailureIsGraceful() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["LKOH.ME"] }));
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.errors[0].code, "data_provider_error");
+    assert.ok(calls.moexCalls >= 1);
+    assert.equal(calls.chartCalls, 0);
+  }, { moexStatus: 503 });
 }
 
 async function testRegularCachedReportReturnedWithoutProviderCall() {
@@ -1327,6 +1432,10 @@ const tests = [
   testProductionFailsClosedWhenAccessUnavailable,
   testProviderFailureReturnsFailedStatus,
   testInternalScannerFailureReturnsFailedStatus,
+  testMoexTickerRoutesToIssProvider,
+  testMoexPaginationPagesUntilEnd,
+  testRegularTickerStaysOnYahoo,
+  testMoexProviderFailureIsGraceful,
   testRegularCachedReportReturnedWithoutProviderCall,
   testMissingPromisedCachedReportFailsClosed,
   testNewFundRepCreatesStructuredReportAndCache,

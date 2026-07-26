@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from datetime import datetime, time as day_time
+from datetime import datetime, time as day_time, timedelta, timezone
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -299,7 +299,139 @@ def send_json(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) 
     handler.wfile.write(body)
 
 
+# --- MOEX ISS (Московская биржа) провайдер для российских тикеров вида SBER.ME ---
+# Yahoo после санкций-2022 не отдаёт .ME тикеры, поэтому для них берём дневные
+# свечи из публичного MOEX ISS API (без ключа). Меняется только источник свечей —
+# формат Candle и вся логика анализа остаются прежними.
+MOEX_ISS_CANDLES_BASE = "https://iss.moex.com/iss/engines/stock/markets/shares/securities"
+MOEX_CANDLE_HISTORY_DAYS = 400  # ~250 торговых дней (хватает на EMA200)
+MOEX_MAX_CANDLE_PAGES = 8  # предохранитель от бесконечной пагинации ISS
+
+
+def is_moex_ticker(ticker: str) -> bool:
+    return str(ticker or "").strip().upper().endswith(".ME")
+
+
+def moex_secid(ticker: str) -> str:
+    normalized = str(ticker or "").strip().upper()
+    return normalized[:-3] if normalized.endswith(".ME") else normalized
+
+
+def _moex_begin_to_timestamp(begin: Any) -> int:
+    # ISS begin: "YYYY-MM-DD HH:MM:SS" (МСК). Важен только порядок/день -> трактуем как UTC.
+    if not begin:
+        return int(time.time())
+    try:
+        dt = datetime.strptime(str(begin), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        try:
+            dt = datetime.strptime(str(begin)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except (ValueError, TypeError):
+            return int(time.time())
+
+
+def _map_moex_candles(columns: list[str], rows: list[list[Any]]) -> list[Candle]:
+    idx = {name: i for i, name in enumerate(columns)}
+    out: list[Candle] = []
+    for row in rows:
+        try:
+            close = float(row[idx["close"]])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        def _num(key: str, fallback: float) -> float:
+            try:
+                value = float(row[idx[key]])
+                return value if value == value else fallback  # отсекаем NaN
+            except (TypeError, ValueError, KeyError, IndexError):
+                return fallback
+        out.append(
+            Candle(
+                timestamp=_moex_begin_to_timestamp(row[idx["begin"]] if "begin" in idx else None),
+                open=_num("open", close),
+                high=_num("high", close),
+                low=_num("low", close),
+                close=close,
+                volume=_num("volume", 0.0),
+            )
+        )
+    return out
+
+
+def _parse_moex_cursor(data: dict) -> dict | None:
+    cursor = data.get("candles.cursor") or {}
+    columns = cursor.get("columns")
+    rows = cursor.get("data")
+    if not isinstance(columns, list) or not isinstance(rows, list) or not rows:
+        return None
+    idx = {name: i for i, name in enumerate(columns)}
+    try:
+        return {
+            "index": int(rows[0][idx["INDEX"]]),
+            "total": int(rows[0][idx["TOTAL"]]),
+            "pagesize": int(rows[0][idx["PAGESIZE"]]),
+        }
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def fetch_moex_candles(ticker: str, timeframe: str) -> list[Candle]:
+    secid = moex_secid(ticker)
+    if not secid:
+        raise ValueError(f"{ticker}: MOEX ISS пустой тикер")
+    till = datetime.now(timezone.utc)
+    from_date = till - timedelta(days=MOEX_CANDLE_HISTORY_DAYS)
+    from_str = from_date.strftime("%Y-%m-%d")
+    till_str = till.strftime("%Y-%m-%d")
+
+    by_timestamp: dict[int, Candle] = {}
+    provider_error = ""
+    start = 0
+    # ISS отдаёт свечи порциями (~500) от старых к новым — проходим все страницы.
+    for _ in range(MOEX_MAX_CANDLE_PAGES):
+        params = urllib.parse.urlencode(
+            {"from": from_str, "till": till_str, "interval": 24, "start": start}
+        )
+        url = f"{MOEX_ISS_CANDLES_BASE}/{urllib.parse.quote(secid)}/candles.json?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            provider_error = f"{secid}: MOEX ISS HTTP {exc.code}"
+            break
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            provider_error = f"{secid}: MOEX ISS ошибка {exc}"
+            break
+        candles_block = data.get("candles") or {}
+        columns = candles_block.get("columns")
+        rows = candles_block.get("data")
+        if not isinstance(columns, list) or not isinstance(rows, list):
+            provider_error = provider_error or f"{secid}: MOEX ISS нет блока candles"
+            break
+        for candle in _map_moex_candles(columns, rows):
+            by_timestamp[candle.timestamp] = candle
+        if not rows:
+            break
+        cursor = _parse_moex_cursor(data)
+        if not cursor:
+            break
+        start = cursor["index"] + len(rows)
+        if start >= cursor["total"]:
+            break
+
+    candles = sorted(by_timestamp.values(), key=lambda c: c.timestamp)
+    if not candles:
+        raise ValueError(provider_error or f"{secid}: MOEX ISS нет рыночных данных")
+    if len(candles) < 60:
+        raise ValueError(f"{ticker}: мало свечей для анализа ({len(candles)})")
+    return candles
+
+
 def fetch_candles(ticker: str, timeframe: str) -> list[Candle]:
+    if is_moex_ticker(ticker):
+        return fetch_moex_candles(ticker, timeframe)
     config = TIMEFRAMES.get(timeframe, TIMEFRAMES["1d"])
     params = urllib.parse.urlencode(
         {
