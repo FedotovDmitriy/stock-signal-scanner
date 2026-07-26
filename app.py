@@ -28,7 +28,8 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8787"))
 MAX_TICKER_LENGTH = 12
-TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-=]{0,11}$")
+# Первый символ — буква или цифра: китайские A-акции имеют числовые коды (600519.SS).
+TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-=]{0,11}$")
 FUNDREP_PDF = Path(
     os.environ.get(
         "FUNDREP_TEMPLATE_PDF",
@@ -429,9 +430,124 @@ def fetch_moex_candles(ticker: str, timeframe: str) -> list[Candle]:
     return candles
 
 
+# --- Eastmoney провайдер для китайских A-акций вида 600519.SS / 000001.SZ ---
+# Yahoo по китайским .SS (Shanghai) / .SZ (Shenzhen), вероятно, не отдаёт данные, поэтому
+# берём дневные свечи из публичного Eastmoney push2his API (без ключа) — по аналогии с MOEX ISS.
+# Меняется только источник свечей — формат Candle и логика анализа остаются прежними.
+EASTMONEY_KLINE_BASE = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+CHINA_KLINE_LIMIT = 800  # с запасом на EMA200 (нужно 250+ торговых дней)
+
+
+def is_china_ticker(ticker: str) -> bool:
+    normalized = str(ticker or "").strip().upper()
+    return normalized.endswith(".SS") or normalized.endswith(".SZ")
+
+
+def china_secid(ticker: str) -> dict | None:
+    # Рынок 1 = Shanghai (.SS), 0 = Shenzhen (.SZ); код = часть до суффикса.
+    normalized = str(ticker or "").strip().upper()
+    if normalized.endswith(".SS"):
+        market, code = 1, normalized[:-3]
+    elif normalized.endswith(".SZ"):
+        market, code = 0, normalized[:-3]
+    else:
+        return None
+    if not code:
+        return None
+    return {"market": market, "code": code, "secid": f"{market}.{code}"}
+
+
+def _china_date_to_timestamp(date: Any) -> int:
+    # Eastmoney: дата свечи "YYYY-MM-DD". Важен только порядок/день -> трактуем как UTC.
+    if not date:
+        return int(time.time())
+    try:
+        dt = datetime.strptime(str(date)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return int(time.time())
+
+
+def _map_eastmoney_candles(klines: list[str]) -> list[Candle]:
+    # Порядок полей из fields2: f51=дата, f52=open, f53=close, f54=high, f55=low, f56=volume, ...
+    out: list[Candle] = []
+    for line in klines:
+        parts = str(line).split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            close = float(parts[2])
+        except (TypeError, ValueError):
+            continue
+
+        def _num(index: int, fallback: float) -> float:
+            try:
+                value = float(parts[index])
+                return value if value == value else fallback  # отсекаем NaN
+            except (TypeError, ValueError, IndexError):
+                return fallback
+
+        out.append(
+            Candle(
+                timestamp=_china_date_to_timestamp(parts[0]),
+                open=_num(1, close),
+                high=_num(3, close),
+                low=_num(4, close),
+                close=close,
+                volume=_num(5, 0.0),
+            )
+        )
+    return out
+
+
+def fetch_china_candles(ticker: str, timeframe: str) -> list[Candle]:
+    parsed = china_secid(ticker)
+    if not parsed:
+        raise ValueError(f"{ticker}: Eastmoney неизвестный китайский тикер")
+    # klt=101 — дневные свечи; fqt=1 — с корректировкой (qfq). Одним запросом отдаётся вся история.
+    params = urllib.parse.urlencode(
+        {
+            "secid": parsed["secid"],
+            "klt": 101,
+            "fqt": 1,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "beg": 0,
+            "end": 20500101,
+            "lmt": CHINA_KLINE_LIMIT,
+        }
+    )
+    url = f"{EASTMONEY_KLINE_BASE}?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"{parsed['code']}: Eastmoney HTTP {exc.code}")
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+        raise ValueError(f"{parsed['code']}: Eastmoney ошибка {exc}")
+
+    # Для неизвестного кода Eastmoney возвращает data == null.
+    klines = ((data or {}).get("data") or {}).get("klines")
+    if not isinstance(klines, list):
+        raise ValueError(f"{parsed['code']}: Eastmoney нет рыночных данных")
+
+    by_timestamp: dict[int, Candle] = {}
+    for candle in _map_eastmoney_candles(klines):
+        by_timestamp[candle.timestamp] = candle
+    candles = sorted(by_timestamp.values(), key=lambda c: c.timestamp)
+    if not candles:
+        raise ValueError(f"{parsed['code']}: Eastmoney нет рыночных данных")
+    if len(candles) < 60:
+        raise ValueError(f"{ticker}: мало свечей для анализа ({len(candles)})")
+    return candles
+
+
 def fetch_candles(ticker: str, timeframe: str) -> list[Candle]:
     if is_moex_ticker(ticker):
         return fetch_moex_candles(ticker, timeframe)
+    if is_china_ticker(ticker):
+        return fetch_china_candles(ticker, timeframe)
     config = TIMEFRAMES.get(timeframe, TIMEFRAMES["1d"])
     params = urllib.parse.urlencode(
         {

@@ -3,7 +3,8 @@ import { fundMetricLabel, isSupportedReportLanguage, normalizeReportLanguage, re
 
 const DEFAULT_STRATEGIES = ["trend", "breakout", "volume_avwap", "momentum"];
 const MAX_TICKER_LENGTH = 12;
-const TICKER_PATTERN = /^[A-Z][A-Z0-9.\-=]{0,11}$/;
+// Первый символ допускаем буквой или цифрой: китайские A-акции имеют числовые коды (600519.SS).
+const TICKER_PATTERN = /^[A-Z0-9][A-Z0-9.\-=]{0,11}$/;
 const MARKET_CACHE_TTL_SECONDS = 15 * 60;
 const RESULT_CACHE_TTL_SECONDS = 15 * 60;
 const TECHNICAL_REPORT_CACHE_TTL_SECONDS = 60 * 60;
@@ -771,8 +772,112 @@ async function fetchMoexCandles(ticker, timeframe, env = {}, options = {}) {
   return candles;
 }
 
+// --- Eastmoney провайдер для китайских A-акций вида 600519.SS / 000001.SZ ---
+// Yahoo по китайским тикерам .SS (Shanghai) / .SZ (Shenzhen), вероятно, не отдаёт данные,
+// поэтому берём дневные свечи из публичного Eastmoney push2his API (без ключа), по аналогии
+// с MOEX ISS для .ME. Меняется только источник свечей — формат свечей и вся логика анализа
+// (EMA200, RSI, ATR, AVWAP) остаются прежними.
+const EASTMONEY_KLINE_BASE = "https://push2his.eastmoney.com/api/qt/stock/kline/get";
+const CHINA_KLINE_LIMIT = 800; // с запасом на EMA200 (нужно 250+ торговых дней)
+
+function isChinaTicker(ticker) {
+  return /\.(SS|SZ)$/i.test(String(ticker || "").trim());
+}
+
+// Разбор тикера в secid Eastmoney: рынок 1 = Shanghai (.SS), 0 = Shenzhen (.SZ),
+// код = часть до суффикса (600519.SS → market=1, code=600519; 000001.SZ → market=0, code=000001).
+function chinaSecid(ticker) {
+  const normalized = String(ticker || "").trim().toUpperCase();
+  const match = normalized.match(/^(.+)\.(SS|SZ)$/);
+  if (!match) return null;
+  const code = match[1];
+  const market = match[2] === "SS" ? 1 : 0;
+  if (!code) return null;
+  return { market, code, secid: `${market}.${code}` };
+}
+
+// Eastmoney отдаёт дату свечи как "YYYY-MM-DD". Важен только порядок/день — трактуем как UTC.
+function chinaDateToTimestamp(date) {
+  if (date == null) return Math.floor(Date.now() / 1000);
+  const ms = Date.parse(`${String(date).slice(0, 10)}T00:00:00Z`);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : Math.floor(Date.now() / 1000);
+}
+
+// Маппинг data.klines (массив CSV-строк) в тот же формат свечей, что у Yahoo/MOEX:
+// { timestamp, open, high, low, close, volume }. Порядок полей задаётся fields2:
+// f51=дата, f52=open, f53=close, f54=high, f55=low, f56=volume, f57=amount, f58=amplitude.
+function mapEastmoneyCandles(klines) {
+  const out = [];
+  for (const line of klines) {
+    const parts = String(line).split(",");
+    if (parts.length < 6) continue;
+    const close = Number(parts[2]);
+    if (!Number.isFinite(close)) continue;
+    const open = Number(parts[1]);
+    const high = Number(parts[3]);
+    const low = Number(parts[4]);
+    out.push({
+      timestamp: chinaDateToTimestamp(parts[0]),
+      open: Number.isFinite(open) ? open : close,
+      high: Number.isFinite(high) ? high : close,
+      low: Number.isFinite(low) ? low : close,
+      close,
+      volume: Number(parts[5] ?? 0) || 0,
+    });
+  }
+  return out;
+}
+
+async function fetchChinaCandles(ticker, timeframe, env = {}, options = {}) {
+  const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
+  const cacheKey = `market:${ticker}:china:${tf.interval}`;
+  const cachedCandles = options.forceRefresh ? null : await getAnalysisCache(env, cacheKey);
+  if (cachedCandles) return cachedCandles;
+
+  const parsed = chinaSecid(ticker);
+  if (!parsed) throw analysisError(`${ticker}: Eastmoney неизвестный китайский тикер`, "NO_MARKET_DATA");
+
+  // klt=101 — дневные свечи; fqt=1 — с корректировкой (qfq). Одним запросом отдаётся вся история,
+  // пагинация не нужна; ограничиваем глубину lmt, чтобы не тянуть лишнее (хватает на EMA200).
+  const url = `${EASTMONEY_KLINE_BASE}?secid=${encodeURIComponent(parsed.secid)}&klt=101&fqt=1`
+    + `&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58`
+    + `&beg=0&end=20500101&lmt=${CHINA_KLINE_LIMIT}`;
+
+  let response;
+  try {
+    response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  } catch (error) {
+    throw analysisError(`${parsed.code}: Eastmoney network error ${error.message || error}`, "DATA_PROVIDER_ERROR");
+  }
+  if (!response.ok) {
+    throw analysisError(`${parsed.code}: Eastmoney HTTP ${response.status}`, "DATA_PROVIDER_ERROR");
+  }
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw analysisError(`${parsed.code}: Eastmoney invalid JSON ${error.message || error}`, "DATA_PROVIDER_ERROR");
+  }
+  // Для неизвестного кода Eastmoney возвращает data == null.
+  const klines = data?.data?.klines;
+  if (!Array.isArray(klines)) {
+    throw analysisError(`${parsed.code}: Eastmoney нет рыночных данных`, "NO_MARKET_DATA");
+  }
+
+  const byTimestamp = new Map();
+  for (const candle of mapEastmoneyCandles(klines)) {
+    byTimestamp.set(candle.timestamp, candle);
+  }
+  const candles = [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
+  if (!candles.length) throw analysisError(`${parsed.code}: Eastmoney нет рыночных данных`, "NO_MARKET_DATA");
+  if (candles.length < 60) throw analysisError("Недостаточно свечей для анализа", "INSUFFICIENT_DATA");
+  await setAnalysisCache(env, cacheKey, "market_candles", candles, MARKET_CACHE_TTL_SECONDS);
+  return candles;
+}
+
 async function fetchCandles(ticker, timeframe, env = {}, options = {}) {
   if (isMoexTicker(ticker)) return fetchMoexCandles(ticker, timeframe, env, options);
+  if (isChinaTicker(ticker)) return fetchChinaCandles(ticker, timeframe, env, options);
   const tf = TIMEFRAMES[timeframe] || TIMEFRAMES["1d"];
   const cacheKey = `market:${ticker}:${tf.interval}:${tf.range}`;
   const cachedCandles = options.forceRefresh ? null : await getAnalysisCache(env, cacheKey);
@@ -1000,8 +1105,13 @@ function statusFromErrorCode(code) {
 }
 
 function dataSourcesForItem(analysisType, fundamentals = null, row = null, ticker = null) {
-  // Для российских .ME тикеров технические свечи берутся из MOEX ISS, а не из Yahoo.
-  const technicalLabel = isMoexTicker(ticker) ? "MOEX ISS" : "Yahoo Finance chart";
+  // Для российских .ME тикеров свечи берутся из MOEX ISS, для китайских .SS/.SZ — из Eastmoney,
+  // остальные — из Yahoo.
+  const technicalLabel = isMoexTicker(ticker)
+    ? "MOEX ISS"
+    : isChinaTicker(ticker)
+      ? "Eastmoney"
+      : "Yahoo Finance chart";
   if (analysisType !== "fundamental") return [technicalLabel];
   const technicalSource = row ? [technicalLabel] : [];
   if (fundamentals?.fundrepDataStatus === "full") return ["Yahoo Finance quoteSummary", ...technicalSource];

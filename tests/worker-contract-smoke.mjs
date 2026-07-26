@@ -78,6 +78,26 @@ function moexCandlesPayload(secid = "SBER", { total = 220, start = 0, pagesize =
   };
 }
 
+// Ответ Eastmoney push2his kline/get: data.klines — массив CSV-строк.
+// Порядок полей по fields2: date,open,close,high,low,volume,amount,amplitude.
+function eastmoneyKlinesPayload(secid = "1.600519", { code = "600519", market = 1, total = 260 } = {}) {
+  const klines = [];
+  const baseMs = Date.UTC(2024, 0, 1);
+  for (let i = 0; i < total; i += 1) {
+    const close = 1500 + i * 0.5;
+    const day = new Date(baseMs + i * 86400 * 1000);
+    const date = day.toISOString().slice(0, 10);
+    const open = close - 0.3;
+    const high = close + 1.2;
+    const low = close - 1.2;
+    const volume = 120000 + i * 100;
+    const amount = close * volume;
+    const amplitude = 1.5;
+    klines.push([date, open, close, high, low, volume, amount, amplitude].join(","));
+  }
+  return { rc: 0, data: { code, market, name: code, klines } };
+}
+
 function fundamentalPayload(symbol = "AAPL") {
   return {
     quoteSummary: {
@@ -183,6 +203,7 @@ async function withMockFetch(testFn, options = {}) {
   let yahooCalls = 0;
   let chartCalls = 0;
   let moexCalls = 0;
+  let eastmoneyCalls = 0;
   let fundamentalCalls = 0;
   let telegramCalls = 0;
   let accessCalls = 0;
@@ -194,6 +215,7 @@ async function withMockFetch(testFn, options = {}) {
   const transportRequestIds = new Set();
   const authorizationHeaders = [];
   const callOrder = [];
+  const eastmoneyRequests = [];
   const telegramMessages = [];
   const businessDecisions = new Map();
   const committedReceipts = new Map();
@@ -371,6 +393,21 @@ async function withMockFetch(testFn, options = {}) {
       const start = Number(parsed.searchParams.get("start") || 0);
       return Response.json(moexCandlesPayload(secid, { start }));
     }
+    if (href.includes("push2his.eastmoney.com")) {
+      eastmoneyCalls += 1;
+      callOrder.push("provider");
+      if (options.eastmoneyStatus) {
+        return Response.json({ error: "eastmoney unavailable" }, { status: options.eastmoneyStatus });
+      }
+      if (options.eastmoneyEmpty) {
+        return Response.json({ rc: 0, data: null });
+      }
+      const parsed = new URL(href);
+      const secid = parsed.searchParams.get("secid") || "1.600519";
+      eastmoneyRequests.push(secid);
+      const [market, code] = secid.split(".");
+      return Response.json(eastmoneyKlinesPayload(secid, { code, market: Number(market) }));
+    }
     if (href.includes("query1.finance.yahoo.com")) {
       yahooCalls += 1;
       chartCalls += 1;
@@ -406,6 +443,7 @@ async function withMockFetch(testFn, options = {}) {
       get yahooCalls() { return yahooCalls; },
       get chartCalls() { return chartCalls; },
       get moexCalls() { return moexCalls; },
+      get eastmoneyCalls() { return eastmoneyCalls; },
       get fundamentalCalls() { return fundamentalCalls; },
       get telegramCalls() { return telegramCalls; },
       get accessCalls() { return accessCalls; },
@@ -417,6 +455,7 @@ async function withMockFetch(testFn, options = {}) {
       transportRequestIds,
       authorizationHeaders,
       callOrder,
+      eastmoneyRequests,
       telegramMessages,
     });
   } finally {
@@ -764,6 +803,67 @@ async function testMoexProviderFailureIsGraceful() {
     assert.ok(calls.moexCalls >= 1);
     assert.equal(calls.chartCalls, 0);
   }, { moexStatus: 503 });
+}
+
+async function testChinaShanghaiTickerRoutesToEastmoney() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["600519.SS"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.report.analysisType, "technical");
+    const item = body.report.items[0];
+    assert.equal(item.ticker, "600519.SS");
+    // Свечи должны приехать из Eastmoney, а не из Yahoo chart.
+    assert.ok(item.dataSources.includes("Eastmoney"));
+    assert.equal(item.dataSources.includes("Yahoo Finance chart"), false);
+    assert.ok(calls.eastmoneyCalls >= 1);
+    assert.equal(calls.chartCalls, 0);
+    // Маппинг Eastmoney -> внутренние свечи корректен: индикаторы посчитаны, цена есть.
+    assert.equal(typeof item.price.value, "number");
+    assert.equal(typeof item.indicators.ema200, "number");
+  });
+}
+
+async function testChinaShenzhenTickerUsesMarketZero() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["000001.SZ"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const item = body.report.items[0];
+    assert.equal(item.ticker, "000001.SZ");
+    assert.ok(item.dataSources.includes("Eastmoney"));
+    assert.ok(calls.eastmoneyCalls >= 1);
+    assert.equal(calls.chartCalls, 0);
+    assert.equal(calls.moexCalls, 0);
+    // Shenzhen -> рынок 0 в secid (проверяем, что запрос ушёл с 0.000001).
+    assert.deepEqual(calls.eastmoneyRequests, ["0.000001"]);
+  });
+}
+
+async function testChinaProviderFailureIsGraceful() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["601398.SS"] }));
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.errors[0].code, "data_provider_error");
+    assert.ok(calls.eastmoneyCalls >= 1);
+    assert.equal(calls.chartCalls, 0);
+  }, { eastmoneyStatus: 503 });
+}
+
+async function testChinaUnknownCodeIsGraceful() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["999999.SZ"] }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const item = body.report.items[0];
+    // data == null у Eastmoney => not_enough_data (graceful, без падения).
+    assert.equal(item.status, "not_enough_data");
+    assert.ok(calls.eastmoneyCalls >= 1);
+    assert.equal(calls.chartCalls, 0);
+  }, { eastmoneyEmpty: true });
 }
 
 async function testRegularCachedReportReturnedWithoutProviderCall() {
@@ -1436,6 +1536,10 @@ const tests = [
   testMoexPaginationPagesUntilEnd,
   testRegularTickerStaysOnYahoo,
   testMoexProviderFailureIsGraceful,
+  testChinaShanghaiTickerRoutesToEastmoney,
+  testChinaShenzhenTickerUsesMarketZero,
+  testChinaProviderFailureIsGraceful,
+  testChinaUnknownCodeIsGraceful,
   testRegularCachedReportReturnedWithoutProviderCall,
   testMissingPromisedCachedReportFailsClosed,
   testNewFundRepCreatesStructuredReportAndCache,
