@@ -234,7 +234,22 @@ async function runContractAnalysisFromPayload(payload, env, origin, requestCount
     await addLog(env, origin, "External contract analysis", tickers.join(", "), "started", `request=${requestId}; timeframe=${timeframe}`, logCountry);
 
     const existing = await getContractResult(env, requestId);
-    const accessChecks = await checkContractAccessForTickers(env, normalized, origin, logCountry, existing);
+    // V7-10: админ-безлимит. Флаг adminBypass/skipAccessCheck honor'ится ТОЛЬКО
+    // потому, что запрос уже прошёл assertServiceToken (см. fetch handler): наш
+    // SERVICE_TOKEN есть исключительно у доверенного сайта, а сайт ставит этот
+    // флаг лишь при серверно-подтверждённом authorized-админе (X-Admin-Key ==
+    // ADMIN_PANEL_KEY). Обычный пользователь идёт через сайт и флаг получить не
+    // может. При bypass ПОЛНОСТЬЮ пропускаем Core access/check → нет списания
+    // дневной квоты, нет лимита; синтезируем «allowed, fresh, без cache-receipt»
+    // решения, чтобы дальнейший пайплайн (regular и fundrep) отработал без
+    // Core-контекста и не коммитил cache-receipt обратно в Core.
+    const adminBypass = payload?.adminBypass === true || payload?.skipAccessCheck === true;
+    const accessChecks = adminBypass
+      ? adminBypassAccessDecisions(normalized)
+      : await checkContractAccessForTickers(env, normalized, origin, logCountry, existing);
+    if (adminBypass) {
+      await addLog(env, origin, "Access check", tickers.join(", "), "bypass", `request=${requestId}; admin unlimited (Core access/check skipped)`, logCountry);
+    }
     const rejectedAccess = accessChecks.find((access) => access.allowed === false);
     if (rejectedAccess) {
       result = contractAccessRejectedResponse(normalized, accessChecks);
@@ -2115,6 +2130,36 @@ async function checkContractAccessForTickers(env, normalized, origin = "-", coun
     await addLog(env, origin, "Access check", normalized.tickers.map((ticker) => ticker.symbol).join(", "), "error", failed.failureCode, country);
   }
   return checks;
+}
+
+// V7-10: синтетические access-решения для админ-безлимита. Возвращаем по одному
+// «allowed» решению на тикер БЕЗ обращения к Core, чтобы:
+//   - rejectedAccess не сработал (все allowed:true) → анализ не отклоняется;
+//   - reportSource="fresh" (не cached) → тикер уходит в свежий анализ;
+//   - quotaDecision="admin_bypass" (не new_/refresh_) → requiresCacheReceipt=false,
+//     значит commitContractCacheReceipts НИЧЕГО не коммитит обратно в Core;
+//   - chargeUnits=0 → никакой квоты не списывается.
+// Работает одинаково для regular и fundrep. Вызывается ТОЛЬКО после
+// assertServiceToken + флага adminBypass от нашего сайта (см. runContractAnalysisFromPayload).
+function adminBypassAccessDecisions(normalized) {
+  return normalized.tickers.map((ticker) => ({
+    contractVersion: CORE_ACCESS_CONTRACT_VERSION,
+    requestId: normalized.requestId,
+    ticker: ticker.symbol,
+    allowed: true,
+    chargeUnits: 0,
+    quotaDecision: "admin_bypass",
+    cacheStatus: null,
+    reportSource: "fresh",
+    remainingUnits: null,
+    reason: "Admin bypass (unlimited)",
+    cacheReceiptId: null,
+    requestCacheStatus: null,
+    requestCacheCreatedAt: null,
+    requestCacheGenerationVersion: null,
+    cacheCommitStatus: null,
+    failureCode: null,
+  }));
 }
 
 function isProduction(env) {

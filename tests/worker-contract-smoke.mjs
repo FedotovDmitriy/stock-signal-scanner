@@ -1515,8 +1515,58 @@ async function testTelegramWebhookSecretRequired() {
   });
 }
 
+// V7-10: админ-безлимит — флаг adminBypass ПОСЛЕ валидного service-token
+// пропускает Core access/check (нет обращения к Core, нет квоты), анализ идёт.
+async function testAdminBypassSkipsCoreAccessCheckRegular() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["ADMR"], userId: "admin-1" , adminBypass: true }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.report.analysisType, "technical");
+    // Core вообще не вызывался: ни access/check, ни commit.
+    assert.equal(calls.accessCalls, 0);
+    assert.equal(calls.commitCalls, 0);
+    assert.equal(calls.coreBindingCalls, 0);
+    // Анализ реально выполнен провайдером.
+    assert.equal(calls.yahooCalls, 1);
+    // Синтезированное решение помечено admin_bypass.
+    assert.equal(body.access[0].quotaDecision, "admin_bypass");
+    assert.equal(body.access[0].allowed, true);
+  });
+}
+
+// Тот же путь для fundrep: админ получает фундаментальный отчёт без Core-квоты.
+async function testAdminBypassSkipsCoreAccessCheckFundRep() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyze(validPayload({ tickers: ["ADMF"], reportType: "fundrep", userId: "admin-2", adminBypass: true }));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "processed");
+    assert.equal(body.report.analysisType, "fundamental");
+    assert.equal(calls.accessCalls, 0);
+    assert.equal(calls.commitCalls, 0);
+    assert.equal(calls.coreBindingCalls, 0);
+    assert.ok(calls.fundamentalCalls >= 1);
+    assert.equal(body.access[0].quotaDecision, "admin_bypass");
+  });
+}
+
+// Безопасность: adminBypass БЕЗ валидного X-Scanner-Token → 403, флаг не honor'ится.
+async function testAdminBypassRequiresServiceToken() {
+  await withMockFetch(async (calls) => {
+    const response = await postAnalyzeWithHeaders(validPayload({ tickers: ["ADMX"], adminBypass: true }), {});
+    assert.equal(response.status, 403);
+    assert.equal(calls.yahooCalls, 0);
+    assert.equal(calls.accessCalls, 0);
+  });
+}
+
 const tests = [
   testValidContractPayload,
+  testAdminBypassSkipsCoreAccessCheckRegular,
+  testAdminBypassSkipsCoreAccessCheckFundRep,
+  testAdminBypassRequiresServiceToken,
   testAccessCheckAllowsAnalysis,
   testCoreHmacRequestContract,
   testAccessCheckUsesCoreServiceBinding,
