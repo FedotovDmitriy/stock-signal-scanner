@@ -45,6 +45,11 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/api/status") {
+        // V7-14: было публично доступно без авторизации — отдавало логи с PII
+        // (Telegram user_id/username/имя/IP, внутренние request_id). Монитор-страница
+        // (`cloudflare/pages/index.html`) уже шлёт X-Admin-Token на каждый вызов api(),
+        // так что легитимный клиент не ломается — блокируется только анонимный доступ.
+        assertAdminToken(request, env);
         const logs = await latestLogs(env);
         const tickerLogs = await latestTickerLogs(env);
         const stats = await latestStats(env);
@@ -1336,7 +1341,19 @@ async function fetchFundamentalData(ticker) {
         },
       };
     } catch (fallbackError) {
-      const providerFailure = error.code === "DATA_PROVIDER_ERROR" || fallbackError.code === "DATA_PROVIDER_ERROR";
+      // V7-14: было — HTTP 401/403 от Yahoo (типичный бот-блок) классифицировался
+      // как NO_MARKET_DATA -> "недостаточно данных", будто проблема в самом
+      // тикере. fetchJsonProviderWithRetry относит к DATA_PROVIDER_ERROR только
+      // 429/5xx — авторизационные отказы (401/403) туда не попадали. Для
+      // фундаментальных данных, в отличие от технического анализа, эта разница
+      // не несёт полезного смысла: почти всегда это блокировка поставщика, а не
+      // отсутствие данных у ликвидной публичной компании. Расширяем детект здесь
+      // (не в общей fetchJsonProviderWithRetry — она используется и для
+      // технического анализа, где 404 у несуществующего тикера должен остаться
+      // NO_MARKET_DATA).
+      const authBlocked = (msg) => /HTTP (401|403)\b/.test(String(msg || ""));
+      const providerFailure = error.code === "DATA_PROVIDER_ERROR" || fallbackError.code === "DATA_PROVIDER_ERROR"
+        || authBlocked(error.message) || authBlocked(fallbackError.message);
       throw analysisError(
         `${ticker}: fundamental providers failed (${error.message || error}; ${fallbackError.message || fallbackError})`,
         providerFailure ? "DATA_PROVIDER_ERROR" : "NO_MARKET_DATA"
